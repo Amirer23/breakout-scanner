@@ -668,8 +668,19 @@ def execute_sell(product_id, usd_amount):
 
 
 def get_balances():
-    """Return a list of (currency, available_amount) for every non-zero balance
-    across all Coinbase accounts, paginating through get_accounts()."""
+    """Return a list of (currency, available_amount, held_amount) for every
+    account with a non-zero total (available + hold) balance, paginating
+    through get_accounts().
+
+    Coinbase reports "available" (immediately tradeable/withdrawable)
+    separately from "hold" (locked in open orders, conversions, etc.) --
+    an asset can have a large real position while showing near-zero
+    available, which looked exactly like a missing position until we
+    started including hold too. Confirmed live on 2026-08-17: a GEOD
+    position worth ~$7,500 (44,307 tokens) had only ~$0.02 in
+    available_balance because almost the whole thing was tied up in an
+    open order -- the old available-only version silently showed it as
+    dust instead of the real position it was."""
     balances = []
     cursor = None
     for _ in range(20):  # hard cap so a pagination bug can't loop forever
@@ -678,12 +689,17 @@ def get_balances():
         for acct in resp.get("accounts", []):
             acct = acct if isinstance(acct, dict) else _to_dict(acct)
             avail = _to_dict(acct.get("available_balance"))
+            hold = _to_dict(acct.get("hold"))
             try:
-                value = float(avail.get("value", 0))
+                avail_value = float(avail.get("value", 0))
             except (TypeError, ValueError):
-                value = 0.0
-            if value > 0:
-                balances.append((acct.get("currency", "?"), value))
+                avail_value = 0.0
+            try:
+                hold_value = float(hold.get("value", 0))
+            except (TypeError, ValueError):
+                hold_value = 0.0
+            if avail_value > 0 or hold_value > 0:
+                balances.append((acct.get("currency", "?"), avail_value, hold_value))
         if not resp.get("has_next"):
             break
         cursor = resp.get("cursor")
@@ -694,7 +710,10 @@ def get_balances():
 
 def handle_balance_command():
     """Handle the /balance Telegram command -- shows free cash (USD/USDC) and
-    the estimated USD value of every other open position."""
+    the estimated USD value of every other open position. Each amount is the
+    TOTAL balance (available + held), with a note when part of it is on
+    hold (e.g. tied up in an open order) -- available-only would understate
+    or completely hide a position that's mostly on hold."""
     if not TRADING_ENABLED:
         telegram_send("Trading is not enabled -- COINBASE_API_KEY / COINBASE_API_SECRET are not set on the server.")
         return
@@ -714,16 +733,20 @@ def handle_balance_command():
     lines = ["💰 Balance"]
     if cash:
         lines.append("\nFree cash:")
-        for currency, amount in cash:
-            lines.append(f"  {currency}: {amount:,.2f}")
+        for currency, avail, hold in cash:
+            total = avail + hold
+            extra = f"  (of which {hold:,.2f} on hold)" if hold > 0 else ""
+            lines.append(f"  {currency}: {total:,.2f}{extra}")
     if positions:
         lines.append("\nOpen positions:")
-        for currency, amount in sorted(positions, key=lambda x: x[0]):
+        for currency, avail, hold in sorted(positions, key=lambda x: x[0]):
+            total = avail + hold
             price = get_current_price(f"{currency}-USD") or get_current_price(f"{currency}-USDC")
+            hold_note = f", {hold:.8g} on hold" if hold > 0 else ""
             if price:
-                lines.append(f"  {currency}: {amount:.8g}  (~${amount * price:,.2f})")
+                lines.append(f"  {currency}: {total:.8g}{hold_note}  (~${total * price:,.2f})")
             else:
-                lines.append(f"  {currency}: {amount:.8g}")
+                lines.append(f"  {currency}: {total:.8g}{hold_note}")
     if not cash and not positions:
         lines.append("\n(nothing to show)")
     telegram_send("\n".join(lines))
