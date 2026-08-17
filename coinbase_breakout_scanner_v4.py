@@ -43,8 +43,10 @@ RUN
 import json
 import math
 import os
+import threading
 import time
 import traceback
+import uuid
 from datetime import datetime, timezone, timedelta
 
 import requests
@@ -98,6 +100,34 @@ FAILURE_THRESHOLD_PCT = float(os.environ.get("FAILURE_THRESHOLD_PCT", "5"))  # p
 #   export TELEGRAM_CHAT_ID="123456789"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# --- Manual trading via Telegram (buy/sell only after an explicit /buy or
+# /sell command from Amir -- nothing here trades automatically) -------------
+# Requires a Coinbase Developer Platform (CDP) API key with TRADE permission.
+# Create one at https://portal.cdp.coinbase.com/ -> API Keys, then set these
+# as environment variables on Render (never in this file, never in chat):
+#   export COINBASE_API_KEY="organizations/{org_id}/apiKeys/{key_id}"
+#   export COINBASE_API_SECRET="-----BEGIN EC PRIVATE KEY----- ..."
+# Also add `coinbase-advanced-py` to requirements.txt.
+# If these aren't set, trading commands are simply disabled -- the scanner
+# and alerts work exactly as before.
+COINBASE_API_KEY = os.environ.get("COINBASE_API_KEY", "")
+COINBASE_API_SECRET = os.environ.get("COINBASE_API_SECRET", "")
+# Fat-finger guard: refuses any single /buy or /sell above this dollar
+# amount. Raise via the MAX_ORDER_USD env var if you genuinely need to trade
+# bigger size -- this is a safety net, not a real limit.
+MAX_ORDER_USD = float(os.environ.get("MAX_ORDER_USD", "1000"))
+TELEGRAM_OFFSET_FILE = "telegram_offset.json"  # tracks which Telegram messages were already handled
+
+TRADING_ENABLED = bool(COINBASE_API_KEY and COINBASE_API_SECRET)
+_trade_client = None
+if TRADING_ENABLED:
+    try:
+        from coinbase.rest import RESTClient
+        _trade_client = RESTClient(api_key=COINBASE_API_KEY, api_secret=COINBASE_API_SECRET)
+    except Exception as e:
+        print(f"  [error] Coinbase trading client failed to initialize -- trading disabled: {e}")
+        TRADING_ENABLED = False
 
 # ----------------------------------------------------------------------------
 # HTTP helpers (rate-limited, with retry/backoff)
@@ -502,6 +532,237 @@ def notify(product_id, result):
 
 
 # ----------------------------------------------------------------------------
+# Manual trading via Telegram (buy / sell / balance) -- all require an
+# explicit /buy, /sell or /balance command sent by the account owner in
+# Telegram. Nothing here ever executes automatically. Disabled entirely
+# (TRADING_ENABLED == False) unless COINBASE_API_KEY/SECRET are set.
+# ----------------------------------------------------------------------------
+
+def _to_dict(obj):
+    """Normalize a Coinbase SDK response object into a plain dict."""
+    if obj is None:
+        return {}
+    if isinstance(obj, dict):
+        return obj
+    to_dict = getattr(obj, "to_dict", None)
+    if callable(to_dict):
+        try:
+            return to_dict()
+        except Exception:
+            pass
+    return {}
+
+
+def telegram_send(text):
+    """Send a plain message to the configured Telegram chat (fire-and-forget)."""
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        return
+    try:
+        session.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            timeout=10,
+        )
+    except requests.RequestException as e:
+        print(f"  [error] Telegram send failed: {e}")
+
+
+def get_current_price(product_id):
+    """Best-effort last price for product_id, or None if it can't be fetched."""
+    candles = fetch_candles(product_id)
+    if not candles:
+        return None
+    return candles[-1][4]
+
+
+def execute_buy(product_id, usd_amount):
+    """Market-buy usd_amount worth of product_id. Reports result via Telegram."""
+    order_id = str(uuid.uuid4())
+    try:
+        resp = _to_dict(_trade_client.market_order_buy(
+            client_order_id=order_id, product_id=product_id, quote_size=str(usd_amount)))
+        if resp.get("success"):
+            telegram_send(f"✅ BUY executed: {product_id} for ${usd_amount}\nOrder ID: {order_id}")
+        else:
+            telegram_send(f"❌ BUY failed: {product_id} for ${usd_amount}\n{resp.get('error_response', resp)}")
+    except Exception as e:
+        telegram_send(f"❌ BUY error: {product_id} for ${usd_amount}\n{e}")
+        print(f"  [error] buy order failed: {e}")
+        traceback.print_exc()
+
+
+def execute_sell(product_id, usd_amount):
+    """Market-sell ~usd_amount worth of product_id (converted to base size at
+    the current price, since Coinbase's sell endpoint takes base size, not
+    quote size). Reports result via Telegram."""
+    order_id = str(uuid.uuid4())
+    price = get_current_price(product_id)
+    if not price:
+        telegram_send(f"❌ SELL failed: couldn't fetch current price for {product_id}")
+        return
+    base_size = usd_amount / price
+    try:
+        resp = _to_dict(_trade_client.market_order_sell(
+            client_order_id=order_id, product_id=product_id, base_size=f"{base_size:.8f}"))
+        if resp.get("success"):
+            telegram_send(f"✅ SELL executed: {product_id} (~${usd_amount})\nOrder ID: {order_id}")
+        else:
+            telegram_send(f"❌ SELL failed: {product_id} for ${usd_amount}\n{resp.get('error_response', resp)}")
+    except Exception as e:
+        telegram_send(f"❌ SELL error: {product_id} for ${usd_amount}\n{e}")
+        print(f"  [error] sell order failed: {e}")
+        traceback.print_exc()
+
+
+def get_balances():
+    """Return a list of (currency, available_amount) for every non-zero balance
+    across all Coinbase accounts, paginating through get_accounts()."""
+    balances = []
+    cursor = None
+    for _ in range(20):  # hard cap so a pagination bug can't loop forever
+        kwargs = {"cursor": cursor} if cursor else {}
+        resp = _to_dict(_trade_client.get_accounts(**kwargs))
+        for acct in resp.get("accounts", []):
+            acct = acct if isinstance(acct, dict) else _to_dict(acct)
+            avail = _to_dict(acct.get("available_balance"))
+            try:
+                value = float(avail.get("value", 0))
+            except (TypeError, ValueError):
+                value = 0.0
+            if value > 0:
+                balances.append((acct.get("currency", "?"), value))
+        if not resp.get("has_next"):
+            break
+        cursor = resp.get("cursor")
+        if not cursor:
+            break
+    return balances
+
+
+def handle_balance_command():
+    """Handle the /balance Telegram command -- shows free cash (USD/USDC) and
+    the estimated USD value of every other open position."""
+    if not TRADING_ENABLED:
+        telegram_send("Trading is not enabled -- COINBASE_API_KEY / COINBASE_API_SECRET are not set on the server.")
+        return
+    try:
+        balances = get_balances()
+    except Exception as e:
+        telegram_send(f"❌ Failed to fetch balances: {e}")
+        print(f"  [error] get_balances failed: {e}")
+        traceback.print_exc()
+        return
+    if not balances:
+        telegram_send("No non-zero balances found.")
+        return
+    cash = [b for b in balances if b[0] in ("USD", "USDC")]
+    positions = [b for b in balances if b[0] not in ("USD", "USDC")]
+    lines = ["💰 Balance"]
+    if cash:
+        lines.append("\nFree cash:")
+        for currency, amount in cash:
+            lines.append(f"  {currency}: {amount:,.2f}")
+    if positions:
+        lines.append("\nOpen positions:")
+        for currency, amount in sorted(positions, key=lambda x: x[0]):
+            price = get_current_price(f"{currency}-USD") or get_current_price(f"{currency}-USDC")
+            if price:
+                lines.append(f"  {currency}: {amount:.8g}  (~${amount * price:,.2f})")
+            else:
+                lines.append(f"  {currency}: {amount:.8g}")
+    if not cash and not positions:
+        lines.append("\n(nothing to show)")
+    telegram_send("\n".join(lines))
+
+
+def parse_and_handle_command(text):
+    """Parse one inbound Telegram message and dispatch it. Every /buy and
+    /sell is a direct, immediate market order once sent -- Telegram itself
+    is the confirmation step (the user must deliberately type/send the
+    command), there is no additional 'are you sure' round-trip."""
+    parts = text.strip().split()
+    if not parts:
+        return
+    cmd = parts[0].lower()
+    if cmd in ("/buy", "/sell"):
+        if len(parts) != 3:
+            telegram_send(f"Usage: {cmd} PRODUCT_ID AMOUNT_USD\nExample: {cmd} BTC-USD 50")
+            return
+        product_id = parts[1].upper()
+        try:
+            amount = float(parts[2])
+        except ValueError:
+            telegram_send(f"Amount must be a number. Got: {parts[2]}")
+            return
+        if amount <= 0:
+            telegram_send("Amount must be positive.")
+            return
+        if amount > MAX_ORDER_USD:
+            telegram_send(f"❌ ${amount} exceeds the MAX_ORDER_USD safety cap (${MAX_ORDER_USD}). Raise it via the Render env var if intentional.")
+            return
+        if not TRADING_ENABLED:
+            telegram_send("Trading is not enabled -- COINBASE_API_KEY / COINBASE_API_SECRET are not set on the server.")
+            return
+        telegram_send(f"⏳ Placing {cmd[1:].upper()} order: {product_id} ${amount:.2f}...")
+        if cmd == "/buy":
+            execute_buy(product_id, amount)
+        else:
+            execute_sell(product_id, amount)
+    elif cmd == "/balance":
+        handle_balance_command()
+    elif cmd == "/help":
+        telegram_send(
+            "Commands:\n"
+            "/buy PRODUCT_ID AMOUNT_USD -- market buy, spending AMOUNT_USD\n"
+            "/sell PRODUCT_ID AMOUNT_USD -- market sell, selling ~AMOUNT_USD worth\n"
+            "/balance -- show free cash and open positions\n"
+            "Example: /buy BTC-USD 50\n"
+            "Trading is " + ("ENABLED" if TRADING_ENABLED else "DISABLED (no API key set)")
+        )
+    else:
+        telegram_send(f"Unknown command: {parts[0]}. Send /help for a list of commands.")
+
+
+def telegram_polling_loop():
+    """Background thread: long-polls Telegram for new messages and executes
+    /buy /sell /balance /help commands. Runs independently of the main scan
+    loop so commands get handled promptly regardless of where the scanner is
+    in its 5-minute cycle. Only messages from TELEGRAM_CHAT_ID are honored."""
+    offset = load_json_file(TELEGRAM_OFFSET_FILE, {}).get("offset", 0)
+    if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
+        print("  [warn] Telegram not configured -- trading command listener disabled.")
+        return
+    print(f"Telegram command listener started. Trading is {'ENABLED' if TRADING_ENABLED else 'DISABLED'}.")
+    while True:
+        try:
+            resp = session.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                params={"offset": offset, "timeout": 30},
+                timeout=35,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            for update in data.get("result", []):
+                offset = update["update_id"] + 1
+                message = update.get("message", {})
+                chat_id = str(message.get("chat", {}).get("id", ""))
+                text = message.get("text", "")
+                if chat_id != str(TELEGRAM_CHAT_ID):
+                    continue  # ignore anyone other than the configured owner chat
+                if text:
+                    print(f"[telegram] received command: {text}")
+                    parse_and_handle_command(text)
+            save_json_file(TELEGRAM_OFFSET_FILE, {"offset": offset})
+        except requests.RequestException as e:
+            print(f"  [error] Telegram polling failed: {e}")
+            time.sleep(5)
+        except Exception:
+            print("  [error] unexpected failure in Telegram polling loop")
+            traceback.print_exc()
+            time.sleep(5)
+
+
+# ----------------------------------------------------------------------------
 # Main scan loop
 # ----------------------------------------------------------------------------
 
@@ -547,6 +808,10 @@ def main():
     state = load_state()
     outcomes = load_json_file(OUTCOMES_FILE, {})
     stats = load_json_file(STATS_FILE, {})
+
+    print(f"Trading: {'ENABLED' if TRADING_ENABLED else 'DISABLED (set COINBASE_API_KEY / COINBASE_API_SECRET to enable)'}")
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        threading.Thread(target=telegram_polling_loop, daemon=True).start()
 
     while True:
         cycle_start = time.time()
