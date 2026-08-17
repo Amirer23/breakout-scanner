@@ -111,8 +111,17 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
 # Also add `coinbase-advanced-py` to requirements.txt.
 # If these aren't set, trading commands are simply disabled -- the scanner
 # and alerts work exactly as before.
-COINBASE_API_KEY = os.environ.get("COINBASE_API_KEY", "")
-COINBASE_API_SECRET = os.environ.get("COINBASE_API_SECRET", "")
+
+# .strip() defensively: pasting the Key ID out of the downloaded JSON file
+# very easily drags along an invisible trailing newline or space, which
+# silently breaks the JWT's sub/kid claim and produces a generic, useless
+# "401 Unauthorized" with no other clue. Confirmed via diagnostic logging
+# on 2026-08-17: COINBASE_API_KEY was landing at 37 chars instead of the
+# expected 36-char UUID, with whitespace at one edge -- this was the actual
+# root cause of every failed /balance attempt that day. Stripping here
+# makes the script robust to that regardless of how the value gets pasted.
+COINBASE_API_KEY = os.environ.get("COINBASE_API_KEY", "").strip()
+COINBASE_API_SECRET = os.environ.get("COINBASE_API_SECRET", "").strip()
 # Fat-finger guard: refuses any single /buy or /sell above this dollar
 # amount. Raise via the MAX_ORDER_USD env var if you genuinely need to trade
 # bigger size -- this is a safety net, not a real limit.
