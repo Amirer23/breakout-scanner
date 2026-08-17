@@ -81,6 +81,7 @@ MAX_RETRIES = 3
 
 STATE_FILE = "scanner_state.json"   # tracks last signal per symbol, to avoid duplicate alerts
 ALERTS_LOG_FILE = "alerts_log.jsonl"
+OPEN_ORDERS_STATE_FILE = "open_orders_state.json"  # which limit order IDs were open last cycle, to detect fills
 
 # --- Outcome tracking (win-rate stats for breakout signals) -----------------
 OUTCOMES_FILE = "outcomes.json"           # pending + resolved trade outcomes
@@ -667,6 +668,158 @@ def execute_sell(product_id, usd_amount):
         traceback.print_exc()
 
 
+def execute_buy_limit(product_id, usd_amount, limit_price):
+    """Place a GTC (good-til-cancelled) limit buy: the order sits open on
+    Coinbase's book at limit_price (or better) until it fills or is
+    cancelled -- unlike a market order, it does NOT execute immediately.
+    usd_amount is converted to a base-currency size using limit_price
+    (not the current market price), since that's the price it will
+    actually transact at if/when it fills."""
+    order_id = str(uuid.uuid4())
+    base_size = usd_amount / limit_price
+    try:
+        resp = _to_dict(_trade_client.limit_order_gtc_buy(
+            client_order_id=order_id, product_id=product_id,
+            base_size=f"{base_size:.8f}", limit_price=str(limit_price)))
+        if resp.get("success"):
+            telegram_send(
+                f"✅ LIMIT BUY placed: {product_id} ~${usd_amount} @ {limit_price}\n"
+                f"Order ID: {order_id}\n"
+                f"(Stays open until filled or cancelled -- check /orders, cancel with /cancel {order_id})"
+            )
+        else:
+            telegram_send(f"❌ LIMIT BUY failed: {product_id} ~${usd_amount} @ {limit_price}\n{resp.get('error_response', resp)}")
+    except Exception as e:
+        detail = _coinbase_error_detail(e)
+        telegram_send(f"❌ LIMIT BUY error: {product_id} ~${usd_amount} @ {limit_price}\n{e}{detail}")
+        print(f"  [error] limit buy order failed: {e}{detail}")
+        traceback.print_exc()
+
+
+def execute_sell_limit(product_id, usd_amount, limit_price):
+    """Place a GTC limit sell at limit_price -- sits open until it fills or
+    is cancelled, unlike a market sell. usd_amount is converted to a
+    base-currency size using limit_price."""
+    order_id = str(uuid.uuid4())
+    base_size = usd_amount / limit_price
+    try:
+        resp = _to_dict(_trade_client.limit_order_gtc_sell(
+            client_order_id=order_id, product_id=product_id,
+            base_size=f"{base_size:.8f}", limit_price=str(limit_price)))
+        if resp.get("success"):
+            telegram_send(
+                f"✅ LIMIT SELL placed: {product_id} ~${usd_amount} @ {limit_price}\n"
+                f"Order ID: {order_id}\n"
+                f"(Stays open until filled or cancelled -- check /orders, cancel with /cancel {order_id})"
+            )
+        else:
+            telegram_send(f"❌ LIMIT SELL failed: {product_id} ~${usd_amount} @ {limit_price}\n{resp.get('error_response', resp)}")
+    except Exception as e:
+        detail = _coinbase_error_detail(e)
+        telegram_send(f"❌ LIMIT SELL error: {product_id} ~${usd_amount} @ {limit_price}\n{e}{detail}")
+        print(f"  [error] limit sell order failed: {e}{detail}")
+        traceback.print_exc()
+
+
+def handle_orders_command():
+    """Handle the /orders Telegram command -- lists currently open (still
+    unfilled) limit orders, so the user can see what's pending and get the
+    order IDs needed for /cancel."""
+    if not TRADING_ENABLED:
+        telegram_send("Trading is not enabled -- COINBASE_API_KEY / COINBASE_API_SECRET are not set on the server.")
+        return
+    try:
+        resp = _to_dict(_trade_client.list_orders(order_status=["OPEN"]))
+    except Exception as e:
+        detail = _coinbase_error_detail(e)
+        telegram_send(f"❌ Failed to fetch open orders: {e}{detail}")
+        print(f"  [error] list_orders failed: {e}{detail}")
+        traceback.print_exc()
+        return
+    orders = resp.get("orders", [])
+    if not orders:
+        telegram_send("📋 No open orders.")
+        return
+    lines = ["📋 Open orders:"]
+    for o in orders:
+        o = o if isinstance(o, dict) else _to_dict(o)
+        cfg = _to_dict(o.get("order_configuration")) or {}
+        limit_cfg = _to_dict(cfg.get("limit_limit_gtc")) or {}
+        price = limit_cfg.get("limit_price", "?")
+        size = limit_cfg.get("base_size", "?")
+        lines.append(
+            f"\n{o.get('product_id', '?')} {o.get('side', '?')}\n"
+            f"  size: {size}  @ {price}\n"
+            f"  order id: {o.get('order_id', '?')}"
+        )
+    telegram_send("\n".join(lines))
+
+
+def handle_cancel_command(order_id):
+    """Handle the /cancel ORDER_ID Telegram command -- cancels one open
+    order (get the ORDER_ID from /orders)."""
+    if not TRADING_ENABLED:
+        telegram_send("Trading is not enabled -- COINBASE_API_KEY / COINBASE_API_SECRET are not set on the server.")
+        return
+    try:
+        resp = _to_dict(_trade_client.cancel_orders(order_ids=[order_id]))
+    except Exception as e:
+        detail = _coinbase_error_detail(e)
+        telegram_send(f"❌ Cancel failed: {order_id}\n{e}{detail}")
+        print(f"  [error] cancel_orders failed: {e}{detail}")
+        traceback.print_exc()
+        return
+    results = resp.get("results", [])
+    result0 = _to_dict(results[0]) if results else {}
+    if result0.get("success"):
+        telegram_send(f"✅ Order cancelled: {order_id}")
+    else:
+        telegram_send(f"❌ Cancel failed: {order_id}\n{result0 or 'no such open order'}")
+
+
+def check_order_fills(known_open_ids):
+    """Called once per scan cycle: diffs the current set of open limit
+    orders against what was open last cycle. Any order that dropped off the
+    open list got resolved somehow (filled, cancelled, or expired) since we
+    last checked -- fetch its final status and push a Telegram notification,
+    so filling a limit order doesn't require the user to remember to check
+    /orders. Returns the updated set of known-open order IDs to persist."""
+    if not TRADING_ENABLED:
+        return known_open_ids
+    try:
+        resp = _to_dict(_trade_client.list_orders(order_status=["OPEN"]))
+    except Exception as e:
+        print(f"  [error] check_order_fills: list_orders failed: {e}")
+        return known_open_ids  # try again next cycle rather than losing track
+
+    current_open_ids = {
+        (o if isinstance(o, dict) else _to_dict(o)).get("order_id")
+        for o in resp.get("orders", [])
+    }
+    current_open_ids.discard(None)
+
+    resolved_ids = known_open_ids - current_open_ids
+    for order_id in resolved_ids:
+        try:
+            order = _to_dict(_to_dict(_trade_client.get_order(order_id)).get("order", {}))
+        except Exception as e:
+            print(f"  [error] check_order_fills: get_order({order_id}) failed: {e}")
+            continue
+        status = order.get("status", "UNKNOWN")
+        product_id = order.get("product_id", "?")
+        side = order.get("side", "?")
+        filled_size = order.get("filled_size", "?")
+        avg_price = order.get("average_filled_price", "?")
+        icon = {"FILLED": "✅", "CANCELLED": "🚫", "EXPIRED": "⌛"}.get(status, "ℹ️")
+        telegram_send(
+            f"{icon} Limit order {status}: {side} {product_id}\n"
+            f"Filled: {filled_size} @ avg {avg_price}\n"
+            f"Order ID: {order_id}"
+        )
+
+    return current_open_ids
+
+
 def get_balances():
     """Return a list of (currency, available_amount, held_amount) for every
     account with a non-zero total (available + hold) balance, paginating
@@ -754,16 +907,24 @@ def handle_balance_command():
 
 def parse_and_handle_command(text):
     """Parse one inbound Telegram message and dispatch it. Every /buy and
-    /sell is a direct, immediate market order once sent -- Telegram itself
-    is the confirmation step (the user must deliberately type/send the
-    command), there is no additional 'are you sure' round-trip."""
+    /sell -- market or limit -- executes (or gets placed) directly once
+    sent: Telegram itself is the confirmation step (the user must
+    deliberately type/send the command), there is no additional 'are you
+    sure' round-trip. /buy and /sell take an optional 4th argument, a limit
+    price -- with it, the order is a GTC limit order that waits on
+    Coinbase's book instead of executing immediately; without it, it's a
+    market order at the current price, exactly as before."""
     parts = text.strip().split()
     if not parts:
         return
     cmd = parts[0].lower()
     if cmd in ("/buy", "/sell"):
-        if len(parts) != 3:
-            telegram_send(f"Usage: {cmd} PRODUCT_ID AMOUNT_USD\nExample: {cmd} BTC-USD 50")
+        if len(parts) not in (3, 4):
+            telegram_send(
+                f"Usage: {cmd} PRODUCT_ID AMOUNT_USD [LIMIT_PRICE]\n"
+                f"Market (immediate, at current price): {cmd} BTC-USD 50\n"
+                f"Limit (waits until price is reached): {cmd} BTC-USD 50 60000"
+            )
             return
         product_id = parts[1].upper()
         try:
@@ -771,6 +932,16 @@ def parse_and_handle_command(text):
         except ValueError:
             telegram_send(f"Amount must be a number. Got: {parts[2]}")
             return
+        limit_price = None
+        if len(parts) == 4:
+            try:
+                limit_price = float(parts[3])
+            except ValueError:
+                telegram_send(f"Limit price must be a number. Got: {parts[3]}")
+                return
+            if limit_price <= 0:
+                telegram_send("Limit price must be positive.")
+                return
         if amount <= 0:
             telegram_send("Amount must be positive.")
             return
@@ -780,20 +951,34 @@ def parse_and_handle_command(text):
         if not TRADING_ENABLED:
             telegram_send("Trading is not enabled -- COINBASE_API_KEY / COINBASE_API_SECRET are not set on the server.")
             return
-        telegram_send(f"⏳ Placing {cmd[1:].upper()} order: {product_id} ${amount:.2f}...")
+        order_kind = f"LIMIT @ {limit_price}" if limit_price else "MARKET"
+        telegram_send(f"⏳ Placing {cmd[1:].upper()} order ({order_kind}): {product_id} ${amount:.2f}...")
         if cmd == "/buy":
-            execute_buy(product_id, amount)
+            execute_buy_limit(product_id, amount, limit_price) if limit_price else execute_buy(product_id, amount)
         else:
-            execute_sell(product_id, amount)
+            execute_sell_limit(product_id, amount, limit_price) if limit_price else execute_sell(product_id, amount)
     elif cmd == "/balance":
         handle_balance_command()
+    elif cmd == "/orders":
+        handle_orders_command()
+    elif cmd == "/cancel":
+        if len(parts) != 2:
+            telegram_send("Usage: /cancel ORDER_ID\n(get the ORDER_ID from /orders)")
+            return
+        handle_cancel_command(parts[1])
     elif cmd == "/help":
         telegram_send(
             "Commands:\n"
-            "/buy PRODUCT_ID AMOUNT_USD -- market buy, spending AMOUNT_USD\n"
-            "/sell PRODUCT_ID AMOUNT_USD -- market sell, selling ~AMOUNT_USD worth\n"
+            "/buy PRODUCT_ID AMOUNT_USD -- market buy, spending AMOUNT_USD immediately at the current price\n"
+            "/buy PRODUCT_ID AMOUNT_USD LIMIT_PRICE -- limit buy, waits until price reaches LIMIT_PRICE or better\n"
+            "/sell PRODUCT_ID AMOUNT_USD -- market sell, selling ~AMOUNT_USD worth immediately at the current price\n"
+            "/sell PRODUCT_ID AMOUNT_USD LIMIT_PRICE -- limit sell, waits until price reaches LIMIT_PRICE or better\n"
+            "/orders -- list open (unfilled) limit orders\n"
+            "/cancel ORDER_ID -- cancel an open limit order (ORDER_ID from /orders)\n"
             "/balance -- show free cash and open positions\n"
-            "Example: /buy BTC-USD 50\n"
+            "Examples:\n"
+            "  /buy BTC-USD 50\n"
+            "  /buy BTC-USD 50 60000\n"
             "Trading is " + ("ENABLED" if TRADING_ENABLED else "DISABLED (no API key set)")
         )
     else:
@@ -885,6 +1070,7 @@ def main():
     state = load_state()
     outcomes = load_json_file(OUTCOMES_FILE, {})
     stats = load_json_file(STATS_FILE, {})
+    known_open_order_ids = set(load_json_file(OPEN_ORDERS_STATE_FILE, []))
 
     # One-time reset requested 2026-08-17: today's earlier breakout alerts
     # happened during heavy debugging/redeploy activity (many restarts while
@@ -928,6 +1114,9 @@ def main():
             outcomes, stats = evaluate_pending_outcomes(outcomes, stats, now)
             save_json_file(OUTCOMES_FILE, outcomes)
             save_json_file(STATS_FILE, stats)
+
+            known_open_order_ids = check_order_fills(known_open_order_ids)
+            save_json_file(OPEN_ORDERS_STATE_FILE, list(known_open_order_ids))
         except Exception:
             # Per-product errors are already caught inside run_cycle, but
             # anything outside that (fetch_products, evaluate_pending_outcomes,
