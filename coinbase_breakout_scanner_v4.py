@@ -886,6 +886,28 @@ def main():
     outcomes = load_json_file(OUTCOMES_FILE, {})
     stats = load_json_file(STATS_FILE, {})
 
+    # One-time reset requested 2026-08-17: today's earlier breakout alerts
+    # happened during heavy debugging/redeploy activity (many restarts while
+    # wiring up trading) and aren't a fair signal, so win/loss tracking
+    # starts clean from this deploy onward. Guarded by a marker file so this
+    # only ever fires once, no matter how many times the service redeploys
+    # afterward. Does NOT touch scanner_state.json (which tracks last-signal
+    # per symbol, to avoid duplicate alerts) -- only the outcome/stats
+    # history is cleared.
+    _RESET_MARKER_FILE = "outcomes_reset_2026-08-17.marker"
+    if not os.path.exists(_RESET_MARKER_FILE):
+        if outcomes or stats:
+            print(f"  [info] one-time reset: clearing {len(outcomes)} pending outcome(s) and stats history (requested 2026-08-17)")
+        outcomes = {}
+        stats = {}
+        save_json_file(OUTCOMES_FILE, outcomes)
+        save_json_file(STATS_FILE, stats)
+        try:
+            with open(_RESET_MARKER_FILE, "w") as f:
+                f.write(datetime.now(timezone.utc).isoformat())
+        except Exception:
+            pass
+
     print(f"Trading: {'ENABLED' if TRADING_ENABLED else 'DISABLED (set COINBASE_API_KEY / COINBASE_API_SECRET to enable)'}")
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         threading.Thread(target=telegram_polling_loop, daemon=True).start()
