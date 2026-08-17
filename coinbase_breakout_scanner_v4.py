@@ -575,6 +575,20 @@ def get_current_price(product_id):
     return candles[-1][4]
 
 
+def _coinbase_error_detail(e):
+    """Best-effort extraction of Coinbase's actual error response body, which
+    usually explains WHY a request was rejected (e.g. invalid signature,
+    unknown key, clock skew) -- far more useful than the generic
+    '401 Client Error: Unauthorized' text alone."""
+    resp = getattr(e, "response", None)
+    if resp is None:
+        return ""
+    try:
+        return f" | body: {resp.text[:500]}"
+    except Exception:
+        return ""
+
+
 def execute_buy(product_id, usd_amount):
     """Market-buy usd_amount worth of product_id. Reports result via Telegram."""
     order_id = str(uuid.uuid4())
@@ -586,8 +600,9 @@ def execute_buy(product_id, usd_amount):
         else:
             telegram_send(f"❌ BUY failed: {product_id} for ${usd_amount}\n{resp.get('error_response', resp)}")
     except Exception as e:
-        telegram_send(f"❌ BUY error: {product_id} for ${usd_amount}\n{e}")
-        print(f"  [error] buy order failed: {e}")
+        detail = _coinbase_error_detail(e)
+        telegram_send(f"❌ BUY error: {product_id} for ${usd_amount}\n{e}{detail}")
+        print(f"  [error] buy order failed: {e}{detail}")
         traceback.print_exc()
 
 
@@ -609,8 +624,9 @@ def execute_sell(product_id, usd_amount):
         else:
             telegram_send(f"❌ SELL failed: {product_id} for ${usd_amount}\n{resp.get('error_response', resp)}")
     except Exception as e:
-        telegram_send(f"❌ SELL error: {product_id} for ${usd_amount}\n{e}")
-        print(f"  [error] sell order failed: {e}")
+        detail = _coinbase_error_detail(e)
+        telegram_send(f"❌ SELL error: {product_id} for ${usd_amount}\n{e}{detail}")
+        print(f"  [error] sell order failed: {e}{detail}")
         traceback.print_exc()
 
 
@@ -648,8 +664,9 @@ def handle_balance_command():
     try:
         balances = get_balances()
     except Exception as e:
-        telegram_send(f"❌ Failed to fetch balances: {e}")
-        print(f"  [error] get_balances failed: {e}")
+        detail = _coinbase_error_detail(e)
+        telegram_send(f"❌ Failed to fetch balances: {e}{detail}")
+        print(f"  [error] get_balances failed: {e}{detail}")
         traceback.print_exc()
         return
     if not balances:
