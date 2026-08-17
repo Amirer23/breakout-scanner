@@ -54,7 +54,10 @@ import requests
 # ----------------------------------------------------------------------------
 
 BASE_URL = "https://api.exchange.coinbase.com"
-QUOTE_CURRENCIES = {"USD"}          # which quote currencies to scan (e.g. also "USDC" if desired)
+QUOTE_CURRENCIES = {"USDC"}         # switched from USD to USDC on 2026-08-17: Amir's actual Coinbase app
+                                     # trading screen quotes every pair in USDC (BTC-USDC, ETH-USDC, etc.),
+                                     # not USD -- scanning USD pairs meant resistance/volume/liquidity were
+                                     # being computed on a different order book than what he actually trades.
 GRANULARITY_SECONDS = 3600          # candle size: 60, 300, 900, 3600, 21600, 86400
 LOOKBACK_CANDLES = 20               # how many candles define "resistance"
 BREAKOUT_VOLUME_RATIO = float(os.environ.get("BREAKOUT_VOLUME_RATIO", "1.5"))
