@@ -54,10 +54,13 @@ import requests
 # ----------------------------------------------------------------------------
 
 BASE_URL = "https://api.exchange.coinbase.com"
-QUOTE_CURRENCIES = {"USDC"}         # switched from USD to USDC on 2026-08-17: Amir's actual Coinbase app
-                                     # trading screen quotes every pair in USDC (BTC-USDC, ETH-USDC, etc.),
-                                     # not USD -- scanning USD pairs meant resistance/volume/liquidity were
-                                     # being computed on a different order book than what he actually trades.
+QUOTE_CURRENCIES = {"USD", "USDC"}  # scan BOTH: Amir's Coinbase app displays pairs as "-USDC", but on
+                                     # Coinbase's Exchange API (what this script calls) only a handful of
+                                     # coins (~5) actually have a distinct USDC order book -- the other
+                                     # ~397 coins' real liquidity is on their "-USD" pair. Scanning USDC
+                                     # alone (tried on 2026-08-17) dropped coverage from 397 coins to 5.
+                                     # Scanning both catches the real liquidity everywhere AND the few
+                                     # genuine USDC-native markets, at the cost of ~5 duplicate scans/cycle.
 GRANULARITY_SECONDS = 3600          # candle size: 60, 300, 900, 3600, 21600, 86400
 LOOKBACK_CANDLES = 20               # how many candles define "resistance"
 BREAKOUT_VOLUME_RATIO = float(os.environ.get("BREAKOUT_VOLUME_RATIO", "1.5"))
@@ -552,7 +555,7 @@ def main():
             print(f"\n=== Cycle start {now.isoformat()} ===")
 
             products = fetch_products()
-            print(f"Scanning {len(products)} USD pairs on Coinbase...")
+            print(f"Scanning {len(products)} pairs on Coinbase ({'/'.join(sorted(QUOTE_CURRENCIES))})...")
 
             if products:
                 state, outcomes = run_cycle(products, state, outcomes)
