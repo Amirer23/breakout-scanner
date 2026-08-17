@@ -63,6 +63,15 @@ QUOTE_CURRENCIES = {"USD", "USDC"}  # scan BOTH: Amir's Coinbase app displays pa
                                      # alone (tried on 2026-08-17) dropped coverage from 397 coins to 5.
                                      # Scanning both catches the real liquidity everywhere AND the few
                                      # genuine USDC-native markets, at the cost of ~5 duplicate scans/cycle.
+# Stablecoins are pegged to ~$1 by design -- normal peg-noise (e.g. USDS
+# ticking from 0.999 to 1.001) can still clear the volume/RSI/close-strength
+# bars and fire a "watching"/"breakout" signal, but it's not a real breakout,
+# just the peg holding. Excluded from scanning entirely (requested 2026-08-17
+# after a false USDS-USD "WATCHING" alert). Add more here if new ones show up.
+STABLECOIN_BASE_SYMBOLS = {
+    "USDT", "USDC", "USDS", "DAI", "PYUSD", "GUSD", "TUSD", "USDP",
+    "FDUSD", "USDD", "EURC", "EURT", "LUSD", "SUSD", "USTC", "USDE",
+}
 GRANULARITY_SECONDS = 3600          # candle size: 60, 300, 900, 3600, 21600, 86400
 LOOKBACK_CANDLES = 20               # how many candles define "resistance"
 BREAKOUT_VOLUME_RATIO = float(os.environ.get("BREAKOUT_VOLUME_RATIO", "1.5"))
@@ -202,6 +211,8 @@ def fetch_products():
     out = []
     for p in data:
         if p.get("quote_currency") not in QUOTE_CURRENCIES:
+            continue
+        if p.get("base_currency") in STABLECOIN_BASE_SYMBOLS:
             continue
         if p.get("trading_disabled"):
             continue
@@ -921,21 +932,25 @@ def parse_and_handle_command(text):
     if cmd in ("/buy", "/sell"):
         if len(parts) not in (3, 4):
             telegram_send(
-                f"Usage: {cmd} PRODUCT_ID AMOUNT_USD [LIMIT_PRICE]\n"
+                f"Usage: {cmd} PRODUCT_ID AMOUNT_USD [, LIMIT_PRICE]\n"
                 f"Market (immediate, at current price): {cmd} BTC-USD 50\n"
-                f"Limit (waits until price is reached): {cmd} BTC-USD 50 60000"
+                f"Limit (waits until price is reached): {cmd} BTC-USD 50, 60000\n"
+                f"(the comma before the price is optional -- just there to keep the two numbers apart)"
             )
             return
         product_id = parts[1].upper()
+        # Accept an optional trailing comma on the amount (e.g. "50," from
+        # "/buy BTC-USD 50, 60000") purely as a readability aid for
+        # separating the two numbers -- strip it before parsing either one.
         try:
-            amount = float(parts[2])
+            amount = float(parts[2].rstrip(","))
         except ValueError:
             telegram_send(f"Amount must be a number. Got: {parts[2]}")
             return
         limit_price = None
         if len(parts) == 4:
             try:
-                limit_price = float(parts[3])
+                limit_price = float(parts[3].rstrip(","))
             except ValueError:
                 telegram_send(f"Limit price must be a number. Got: {parts[3]}")
                 return
@@ -970,15 +985,16 @@ def parse_and_handle_command(text):
         telegram_send(
             "Commands:\n"
             "/buy PRODUCT_ID AMOUNT_USD -- market buy, spending AMOUNT_USD immediately at the current price\n"
-            "/buy PRODUCT_ID AMOUNT_USD LIMIT_PRICE -- limit buy, waits until price reaches LIMIT_PRICE or better\n"
+            "/buy PRODUCT_ID AMOUNT_USD, LIMIT_PRICE -- limit buy, waits until price reaches LIMIT_PRICE or better\n"
             "/sell PRODUCT_ID AMOUNT_USD -- market sell, selling ~AMOUNT_USD worth immediately at the current price\n"
-            "/sell PRODUCT_ID AMOUNT_USD LIMIT_PRICE -- limit sell, waits until price reaches LIMIT_PRICE or better\n"
+            "/sell PRODUCT_ID AMOUNT_USD, LIMIT_PRICE -- limit sell, waits until price reaches LIMIT_PRICE or better\n"
+            "(the comma before LIMIT_PRICE is optional -- just there to keep the two numbers apart)\n"
             "/orders -- list open (unfilled) limit orders\n"
             "/cancel ORDER_ID -- cancel an open limit order (ORDER_ID from /orders)\n"
             "/balance -- show free cash and open positions\n"
             "Examples:\n"
             "  /buy BTC-USD 50\n"
-            "  /buy BTC-USD 50 60000\n"
+            "  /buy BTC-USD 50, 60000\n"
             "Trading is " + ("ENABLED" if TRADING_ENABLED else "DISABLED (no API key set)")
         )
     else:
