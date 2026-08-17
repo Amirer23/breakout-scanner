@@ -122,6 +122,34 @@ TELEGRAM_OFFSET_FILE = "telegram_offset.json"  # tracks which Telegram messages 
 TRADING_ENABLED = bool(COINBASE_API_KEY and COINBASE_API_SECRET)
 _trade_client = None
 if TRADING_ENABLED:
+    # Content-free diagnostic: prints ONLY lengths/shape, never the actual
+    # key or secret. This exists to catch a very common failure mode --
+    # stray quote marks, commas, or whitespace accidentally copy-pasted
+    # along with the value when copying out of the downloaded JSON file --
+    # which produces exactly a generic 401 Unauthorized with no other clue,
+    # since the SDK never validates the api_key string's shape, only the
+    # private key's.
+    try:
+        _key_has_stray_chars = any(c in COINBASE_API_KEY for c in ('"', "'", ",", "{", "}", "\n", "\r", "\t"))
+        _key_has_edge_ws = COINBASE_API_KEY != COINBASE_API_KEY.strip()
+        print(
+            f"  [debug] COINBASE_API_KEY: length={len(COINBASE_API_KEY)} "
+            f"(expect 36 for a bare Key ID UUID, longer for organizations/.../apiKeys/... format) "
+            f"has_stray_chars(quotes/commas/braces/newlines)={_key_has_stray_chars} "
+            f"has_leading_or_trailing_whitespace={_key_has_edge_ws}"
+        )
+        _secret_stripped = "".join(COINBASE_API_SECRET.split())
+        _secret_has_stray_chars = any(c in COINBASE_API_SECRET for c in ('"', "'", ",", "{", "}"))
+        _secret_looks_pem = COINBASE_API_SECRET.lstrip().startswith("-----BEGIN")
+        print(
+            f"  [debug] COINBASE_API_SECRET: raw_length={len(COINBASE_API_SECRET)} "
+            f"whitespace_stripped_length={len(_secret_stripped)} "
+            f"(expect 44 for a 32-byte Ed25519 seed, 88 for a 64-byte seed||pubkey, if not PEM) "
+            f"looks_like_pem={_secret_looks_pem} "
+            f"has_stray_chars(quotes/commas/braces)={_secret_has_stray_chars}"
+        )
+    except Exception:
+        pass
     try:
         from coinbase.rest import RESTClient
         _trade_client = RESTClient(api_key=COINBASE_API_KEY, api_secret=COINBASE_API_SECRET)
