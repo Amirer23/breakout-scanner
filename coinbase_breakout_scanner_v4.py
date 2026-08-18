@@ -48,6 +48,7 @@ import time
 import traceback
 import uuid
 from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
@@ -129,6 +130,20 @@ FAILURE_THRESHOLD_PCT = float(os.environ.get("FAILURE_THRESHOLD_PCT", "5"))  # p
 #   export TELEGRAM_CHAT_ID="123456789"
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+
+# All trade times are stored internally in UTC (datetime.now(timezone.utc)) --
+# that never changes and is DST-safe. /history only converts to this
+# timezone at DISPLAY time, so changing it doesn't require re-writing any
+# stored data. Confirmed live on 2026-08-18 that showing raw UTC in /history
+# was confusing next to the user's own wall clock (Amsterdam) -- defaults to
+# Europe/Amsterdam; override via the DISPLAY_TIMEZONE env var if needed.
+# Falls back to UTC if the configured zone name isn't recognized (e.g. the
+# tzdata package is missing) rather than crashing the whole bot over a
+# cosmetic display setting.
+try:
+    DISPLAY_TIMEZONE = ZoneInfo(os.environ.get("DISPLAY_TIMEZONE", "Europe/Amsterdam"))
+except ZoneInfoNotFoundError:
+    DISPLAY_TIMEZONE = timezone.utc
 
 # --- Manual trading via Telegram (buy/sell only after an explicit /buy or
 # /sell command from Amir -- nothing here trades automatically) -------------
@@ -666,6 +681,24 @@ def _to_dict(obj):
         except Exception:
             pass
     return {}
+
+
+def _format_display_time(iso_str):
+    """Convert a stored UTC ISO timestamp (from datetime.now(timezone.utc)
+    .isoformat()) to DISPLAY_TIMEZONE for /history output. Falls back to
+    showing the raw stored value labeled UTC if it can't be parsed, rather
+    than letting a bad/missing timestamp break the whole /history reply."""
+    if not iso_str:
+        return "? UTC"
+    try:
+        dt = datetime.fromisoformat(iso_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local_dt = dt.astimezone(DISPLAY_TIMEZONE)
+        tz_label = local_dt.tzname() or str(DISPLAY_TIMEZONE)
+        return local_dt.strftime("%Y-%m-%d %H:%M") + f" {tz_label}"
+    except (ValueError, TypeError):
+        return str(iso_str)[:16].replace("T", " ") + " UTC"
 
 
 def telegram_send(text):
@@ -1512,7 +1545,7 @@ def handle_history_command(limit=10):
     recent = trades[-limit:][::-1]  # most recent first
     entries = []
     for t in recent:
-        ts = str(t.get("time", "?"))[:16].replace("T", " ")
+        ts = _format_display_time(t.get("time"))
         side = t.get("side", "?")
         kind = t.get("kind", "?")
         status = t.get("status", "?")
@@ -1531,7 +1564,7 @@ def handle_history_command(limit=10):
             except (TypeError, ValueError):
                 pass
         entries.append(
-            f"\n{ts} UTC\n"
+            f"\n{ts}\n"
             f"{side} {kind} {product_id} -- {status}{usd_str}{size_str}{price_str}{fee_str}\n"
             f"order: {t.get('order_id', '?')}"
         )
