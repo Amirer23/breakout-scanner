@@ -88,14 +88,32 @@ CYCLE_SLEEP_SECONDS = 300           # 5 minutes between full scan cycles
 REQUEST_PACING_SECONDS = 0.35       # ~3 requests/sec, safely under Coinbase's public rate limit
 MAX_RETRIES = 3
 
-STATE_FILE = "scanner_state.json"   # tracks last signal per symbol, to avoid duplicate alerts
-ALERTS_LOG_FILE = "alerts_log.jsonl"
-OPEN_ORDERS_STATE_FILE = "open_orders_state.json"  # which limit order IDs were open last cycle, to detect fills
-TRADES_FILE = "trades.json"         # ledger of every /buy /sell placed via the bot + limit-order resolutions (requested 2026-08-18, position tracking)
+# Persistent state directory. Render's default filesystem is EPHEMERAL --
+# every file written to the plain working directory is wiped on each
+# deploy. Confirmed live on 2026-08-18: trades.json (and therefore
+# /history) silently reset to empty after a routine code deploy, even
+# though nothing was wrong with the trades themselves on Coinbase's side.
+# Fixed by attaching a persistent Disk in Render (mounted at /var/data)
+# and pointing all state files at it instead. Falls back to the plain
+# working directory if DATA_DIR doesn't exist -- e.g. running locally, or
+# before a disk is attached -- so this doesn't break anything else.
+DATA_DIR = os.environ.get("DATA_DIR", "/var/data")
+if not os.path.isdir(DATA_DIR):
+    DATA_DIR = "."
+
+
+def _data_path(filename):
+    return os.path.join(DATA_DIR, filename)
+
+
+STATE_FILE = _data_path("scanner_state.json")   # tracks last signal per symbol, to avoid duplicate alerts
+ALERTS_LOG_FILE = _data_path("alerts_log.jsonl")
+OPEN_ORDERS_STATE_FILE = _data_path("open_orders_state.json")  # which limit order IDs were open last cycle, to detect fills
+TRADES_FILE = _data_path("trades.json")         # ledger of every /buy /sell placed via the bot + limit-order resolutions (requested 2026-08-18, position tracking)
 
 # --- Outcome tracking (win-rate stats for breakout signals) -----------------
-OUTCOMES_FILE = "outcomes.json"           # pending + resolved trade outcomes
-STATS_FILE = "stats.json"                 # cumulative win/loss counters
+OUTCOMES_FILE = _data_path("outcomes.json")           # pending + resolved trade outcomes
+STATS_FILE = _data_path("stats.json")                 # cumulative win/loss counters
 EVALUATION_HOURS = float(os.environ.get("EVALUATION_HOURS", "48"))     # how long after a breakout to check the result
 # NOTE: these fallback defaults were out of sync with the documented "current
 # value" of 5% in breakout-scanner-summary.md / README.md (code previously
@@ -137,7 +155,7 @@ COINBASE_API_SECRET = os.environ.get("COINBASE_API_SECRET", "").strip()
 # amount. Raise via the MAX_ORDER_USD env var if you genuinely need to trade
 # bigger size -- this is a safety net, not a real limit.
 MAX_ORDER_USD = float(os.environ.get("MAX_ORDER_USD", "1000"))
-TELEGRAM_OFFSET_FILE = "telegram_offset.json"  # tracks which Telegram messages were already handled
+TELEGRAM_OFFSET_FILE = _data_path("telegram_offset.json")  # tracks which Telegram messages were already handled
 
 TRADING_ENABLED = bool(COINBASE_API_KEY and COINBASE_API_SECRET)
 _trade_client = None
@@ -1812,7 +1830,11 @@ def main():
     # afterward. Does NOT touch scanner_state.json (which tracks last-signal
     # per symbol, to avoid duplicate alerts) -- only the outcome/stats
     # history is cleared.
-    _RESET_MARKER_FILE = "outcomes_reset_2026-08-17.marker"
+    # Lives in DATA_DIR too -- now that outcomes.json/stats.json persist
+    # across deploys (see DATA_DIR above), this marker must also persist,
+    # or the one-time reset would fire again on every future deploy and
+    # silently wipe stats that are now actually being kept.
+    _RESET_MARKER_FILE = _data_path("outcomes_reset_2026-08-17.marker")
     if not os.path.exists(_RESET_MARKER_FILE):
         if outcomes or stats:
             print(f"  [info] one-time reset: clearing {len(outcomes)} pending outcome(s) and stats history (requested 2026-08-17)")
