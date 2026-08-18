@@ -751,6 +751,78 @@ def execute_sell(product_id, usd_amount):
         traceback.print_exc()
 
 
+def execute_sell_all(product_id):
+    """Market-sell the ENTIRE available balance of product_id's base
+    currency -- e.g. "/sell SOL-USDC all" sells every available SOL.
+
+    Unlike execute_sell(), this does not take a usd_amount and does not
+    estimate a base_size from it. It reads the real available_balance
+    straight from Coinbase (via get_balances()) and sells exactly that,
+    so there's no risk of a stale/rounded guess leaving dust behind or
+    overshooting into an "insufficient funds" rejection. Only the
+    AVAILABLE portion is sold (not held) -- balance tied up in an open
+    order can't be sold until that order is filled or cancelled; the
+    Telegram reply says so explicitly if any is on hold.
+
+    Still enforces MAX_ORDER_USD, same as every other order path -- "sell
+    all" is deliberate, not a typo, but the position could still have
+    grown past the cap since it was set, and the cap exists precisely so
+    no single command can move more than the user has explicitly allowed
+    without raising it first."""
+    base_currency = product_id.split("-")[0]
+    try:
+        balances = get_balances()
+    except Exception as e:
+        detail = _coinbase_error_detail(e)
+        telegram_send(f"❌ SELL ALL failed: couldn't fetch balances for {product_id}\n{e}{detail}")
+        print(f"  [error] execute_sell_all({product_id}): get_balances failed: {e}{detail}")
+        traceback.print_exc()
+        return
+    match = next((b for b in balances if b[0] == base_currency), None)
+    if not match or match[1] <= 0:
+        held_note = ""
+        if match and match[2] > 0:
+            held_note = f" ({match[2]:.8g} {base_currency} exists but is on hold, e.g. tied up in an open order -- cancel it first with /cancel)"
+        telegram_send(f"❌ SELL ALL failed: no available {base_currency} balance to sell.{held_note}")
+        return
+    _, available, held = match
+    price = get_current_price(product_id)
+    if not price:
+        telegram_send(f"❌ SELL ALL failed: couldn't fetch current price for {product_id}")
+        return
+    usd_value = available * price
+    if usd_value > MAX_ORDER_USD:
+        telegram_send(
+            f"❌ SELL ALL blocked: {available:.8g} {base_currency} (~${usd_value:,.2f}) exceeds the "
+            f"MAX_ORDER_USD safety cap (${MAX_ORDER_USD:,.0f}). Raise it via the Render env var if intentional."
+        )
+        return
+    order_id = str(uuid.uuid4())
+    held_note = f"\n({held:.8g} {base_currency} still on hold, not included)" if held > 0 else ""
+    try:
+        resp = _to_dict(_trade_client.market_order_sell(
+            client_order_id=order_id, product_id=product_id, base_size=f"{available:.8f}"))
+        if resp.get("success"):
+            telegram_send(
+                f"✅ SELL ALL executed: {product_id} -- sold {available:.8g} {base_currency} (~${usd_value:,.2f})"
+                f"\nOrder ID: {order_id}{held_note}"
+            )
+            filled_size, avg_price = _try_fetch_fill_info(order_id)
+            record_trade({
+                "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
+                "side": "SELL", "kind": "market", "status": "executed",
+                "amount_usd": usd_value, "base_size": filled_size or f"{available:.8f}", "price": avg_price,
+                "order_id": order_id,
+            })
+        else:
+            telegram_send(f"❌ SELL ALL failed: {product_id}\n{resp.get('error_response', resp)}")
+    except Exception as e:
+        detail = _coinbase_error_detail(e)
+        telegram_send(f"❌ SELL ALL error: {product_id}\n{e}{detail}")
+        print(f"  [error] sell-all order failed: {e}{detail}")
+        traceback.print_exc()
+
+
 def execute_buy_limit(product_id, usd_amount, limit_price):
     """Place a GTC (good-til-cancelled) limit buy: the order sits open on
     Coinbase's book at limit_price (or better) until it fills or is
@@ -1206,10 +1278,22 @@ def parse_and_handle_command(text):
                 f"Usage: {cmd} PRODUCT_ID AMOUNT_USD [, LIMIT_PRICE]\n"
                 f"Market (immediate, at current price): {cmd} BTC-USD 50\n"
                 f"Limit (waits until price is reached): {cmd} BTC-USD 50, 60000\n"
-                f"(the comma before the price is optional -- just there to keep the two numbers apart)"
+                f"(the comma before the price is optional -- just there to keep the two numbers apart)\n"
+                + ("/sell PRODUCT_ID all -- sell the entire available balance\n" if cmd == "/sell" else "")
             )
             return
         product_id = parts[1].upper()
+        # "/sell PRODUCT_ID all" -- sell the whole available balance. This
+        # skips the AMOUNT_USD parsing below entirely: there's no amount to
+        # parse, and execute_sell_all() looks up the real balance straight
+        # from Coinbase rather than working from an estimate.
+        if cmd == "/sell" and len(parts) == 3 and parts[2].lower() == "all":
+            if not TRADING_ENABLED:
+                telegram_send("Trading is not enabled -- COINBASE_API_KEY / COINBASE_API_SECRET are not set on the server.")
+                return
+            telegram_send(f"⏳ Placing SELL ALL order (MARKET): {product_id}...")
+            execute_sell_all(product_id)
+            return
         # Accept an optional trailing comma on the amount (e.g. "50," from
         # "/buy BTC-USD 50, 60000") purely as a readability aid for
         # separating the two numbers -- strip it before parsing either one.
@@ -1279,6 +1363,7 @@ def parse_and_handle_command(text):
             "/buy PRODUCT_ID AMOUNT_USD, LIMIT_PRICE -- limit buy, waits until price reaches LIMIT_PRICE or better\n"
             "/sell PRODUCT_ID AMOUNT_USD -- market sell, selling ~AMOUNT_USD worth immediately at the current price\n"
             "/sell PRODUCT_ID AMOUNT_USD, LIMIT_PRICE -- limit sell, waits until price reaches LIMIT_PRICE or better\n"
+            "/sell PRODUCT_ID all -- market sell the entire available balance of that coin\n"
             "(the comma before LIMIT_PRICE is optional -- just there to keep the two numbers apart)\n"
             "/orders -- list open (unfilled) limit orders\n"
             "/cancel ORDER_ID -- cancel an open limit order (ORDER_ID from /orders)\n"
