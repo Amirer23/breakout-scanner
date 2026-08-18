@@ -91,6 +91,7 @@ MAX_RETRIES = 3
 STATE_FILE = "scanner_state.json"   # tracks last signal per symbol, to avoid duplicate alerts
 ALERTS_LOG_FILE = "alerts_log.jsonl"
 OPEN_ORDERS_STATE_FILE = "open_orders_state.json"  # which limit order IDs were open last cycle, to detect fills
+TRADES_FILE = "trades.json"         # ledger of every /buy /sell placed via the bot + limit-order resolutions (requested 2026-08-18, position tracking)
 
 # --- Outcome tracking (win-rate stats for breakout signals) -----------------
 OUTCOMES_FILE = "outcomes.json"           # pending + resolved trade outcomes
@@ -667,6 +668,34 @@ def _coinbase_error_detail(e):
         return ""
 
 
+def record_trade(entry):
+    """Append one entry to the persisted trade/position ledger (trades.json)
+    and save. This is what /history and /positions read from -- called on
+    every successful market execution, limit-order placement, and eventual
+    limit-order resolution (filled/cancelled/expired), so there's a full,
+    durable record of everything the bot has actually done, independent of
+    Telegram's own chat history. Caps the file at the most recent 500
+    entries so it doesn't grow forever."""
+    trades = load_json_file(TRADES_FILE, [])
+    trades.append(entry)
+    if len(trades) > 500:
+        trades = trades[-500:]
+    save_json_file(TRADES_FILE, trades)
+
+
+def _try_fetch_fill_info(order_id):
+    """Best-effort lookup of an order's filled_size/average_filled_price
+    immediately after placing it. Market orders on Coinbase typically fill
+    within a second or two, so this usually already has real fill data by
+    the time we ask -- but it's purely a nice-to-have for the trade log,
+    never allowed to raise or block the calling function."""
+    try:
+        order = _to_dict(_to_dict(_trade_client.get_order(order_id)).get("order", {}))
+        return order.get("filled_size"), order.get("average_filled_price")
+    except Exception:
+        return None, None
+
+
 def execute_buy(product_id, usd_amount):
     """Market-buy usd_amount worth of product_id. Reports result via Telegram."""
     order_id = str(uuid.uuid4())
@@ -675,6 +704,13 @@ def execute_buy(product_id, usd_amount):
             client_order_id=order_id, product_id=product_id, quote_size=str(usd_amount)))
         if resp.get("success"):
             telegram_send(f"✅ BUY executed: {product_id} for ${usd_amount}\nOrder ID: {order_id}")
+            filled_size, avg_price = _try_fetch_fill_info(order_id)
+            record_trade({
+                "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
+                "side": "BUY", "kind": "market", "status": "executed",
+                "amount_usd": usd_amount, "base_size": filled_size, "price": avg_price,
+                "order_id": order_id,
+            })
         else:
             telegram_send(f"❌ BUY failed: {product_id} for ${usd_amount}\n{resp.get('error_response', resp)}")
     except Exception as e:
@@ -699,6 +735,13 @@ def execute_sell(product_id, usd_amount):
             client_order_id=order_id, product_id=product_id, base_size=f"{base_size:.8f}"))
         if resp.get("success"):
             telegram_send(f"✅ SELL executed: {product_id} (~${usd_amount})\nOrder ID: {order_id}")
+            filled_size, avg_price = _try_fetch_fill_info(order_id)
+            record_trade({
+                "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
+                "side": "SELL", "kind": "market", "status": "executed",
+                "amount_usd": usd_amount, "base_size": filled_size or f"{base_size:.8f}", "price": avg_price,
+                "order_id": order_id,
+            })
         else:
             telegram_send(f"❌ SELL failed: {product_id} for ${usd_amount}\n{resp.get('error_response', resp)}")
     except Exception as e:
@@ -727,6 +770,16 @@ def execute_buy_limit(product_id, usd_amount, limit_price):
                 f"Order ID: {order_id}\n"
                 f"(Stays open until filled or cancelled -- check /orders, cancel with /cancel {order_id})"
             )
+            # status "placed", not "executed" -- this is not a fill yet, just
+            # an order sitting on the book. check_order_fills() appends a
+            # second ledger entry (status filled/cancelled/expired) once its
+            # fate is known, so /history shows the full lifecycle.
+            record_trade({
+                "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
+                "side": "BUY", "kind": "limit", "status": "placed",
+                "amount_usd": usd_amount, "base_size": f"{base_size:.8f}", "price": limit_price,
+                "order_id": order_id,
+            })
         else:
             telegram_send(f"❌ LIMIT BUY failed: {product_id} ~${usd_amount} @ {limit_price}\n{resp.get('error_response', resp)}")
     except Exception as e:
@@ -752,6 +805,12 @@ def execute_sell_limit(product_id, usd_amount, limit_price):
                 f"Order ID: {order_id}\n"
                 f"(Stays open until filled or cancelled -- check /orders, cancel with /cancel {order_id})"
             )
+            record_trade({
+                "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
+                "side": "SELL", "kind": "limit", "status": "placed",
+                "amount_usd": usd_amount, "base_size": f"{base_size:.8f}", "price": limit_price,
+                "order_id": order_id,
+            })
         else:
             telegram_send(f"❌ LIMIT SELL failed: {product_id} ~${usd_amount} @ {limit_price}\n{resp.get('error_response', resp)}")
     except Exception as e:
@@ -856,6 +915,14 @@ def check_order_fills(known_open_ids):
             f"Filled: {filled_size} @ avg {avg_price}\n"
             f"Order ID: {order_id}"
         )
+        # Second ledger entry for this order_id (the first was "placed", from
+        # execute_buy_limit/execute_sell_limit) -- gives /history and
+        # /positions the order's final outcome, not just its opening.
+        record_trade({
+            "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
+            "side": side, "kind": "limit", "status": status.lower(),
+            "base_size": filled_size, "price": avg_price, "order_id": order_id,
+        })
 
     return current_open_ids
 
@@ -945,6 +1012,181 @@ def handle_balance_command():
     telegram_send("\n".join(lines))
 
 
+def _compute_avg_entry_prices():
+    """Build a simple average-cost-basis ledger per product_id by replaying
+    trades.json in order: tracks running quantity and running cost basis
+    per symbol using the AVERAGE COST method (not FIFO) -- on a partial
+    sell, the average entry price is unchanged, only quantity and total
+    cost basis shrink proportionally. Only counts entries with status
+    "executed" (market fills) or "filled" (resolved limit orders) that
+    have a known numeric base_size and price -- a limit order still sitting
+    at status "placed" isn't an actual transaction yet, so it's skipped.
+    Returns {product_id: avg_entry_price}."""
+    trades = load_json_file(TRADES_FILE, [])
+    ledger = {}  # product_id -> {"qty": float, "cost": float}
+    for t in trades:
+        if t.get("status") not in ("executed", "filled"):
+            continue
+        product_id = t.get("product_id")
+        side = t.get("side")
+        try:
+            size = float(t.get("base_size"))
+            price = float(t.get("price"))
+        except (TypeError, ValueError):
+            continue
+        if size <= 0 or price <= 0:
+            continue
+        pos = ledger.setdefault(product_id, {"qty": 0.0, "cost": 0.0})
+        if side == "BUY":
+            pos["qty"] += size
+            pos["cost"] += size * price
+        elif side == "SELL" and pos["qty"] > 0:
+            sell_qty = min(size, pos["qty"])
+            pos["cost"] *= (pos["qty"] - sell_qty) / pos["qty"]
+            pos["qty"] -= sell_qty
+    return {
+        product_id: (pos["cost"] / pos["qty"])
+        for product_id, pos in ledger.items()
+        if pos["qty"] > 1e-12
+    }
+
+
+def handle_positions_command():
+    """Handle the /positions Telegram command -- cross-references the bot's
+    own trade ledger (trades.json, average-cost basis) against the REAL
+    current Coinbase balances (get_balances(), always the source of truth
+    for what you actually hold) to show an entry price and unrealized P&L
+    for each open position.
+
+    Important limitation: the average entry price is only known for
+    quantity actually bought THROUGH this bot's /buy command. Anything
+    bought outside the bot (directly in the Coinbase app, or before this
+    feature existed) has no trade-log entry, so its entry price is
+    genuinely unknown -- those rows say so explicitly rather than showing
+    a wrong or misleading number."""
+    if not TRADING_ENABLED:
+        telegram_send("Trading is not enabled -- COINBASE_API_KEY / COINBASE_API_SECRET are not set on the server.")
+        return
+    try:
+        balances = get_balances()
+    except Exception as e:
+        detail = _coinbase_error_detail(e)
+        telegram_send(f"❌ Failed to fetch balances: {e}{detail}")
+        print(f"  [error] get_balances failed (in /positions): {e}{detail}")
+        traceback.print_exc()
+        return
+    positions = [b for b in balances if b[0] not in ("USD", "USDC")]
+    if not positions:
+        telegram_send("📈 No open positions.")
+        return
+    avg_entries = _compute_avg_entry_prices()
+    lines = ["📈 Open positions:"]
+    for currency, avail, hold in sorted(positions, key=lambda x: x[0]):
+        total = avail + hold
+        current_price = get_current_price(f"{currency}-USD") or get_current_price(f"{currency}-USDC")
+        entry_price = avg_entries.get(f"{currency}-USD") or avg_entries.get(f"{currency}-USDC")
+        line = f"\n{currency}: {total:.8g}"
+        if current_price:
+            line += f"  (~${total * current_price:,.2f})"
+        if entry_price and current_price:
+            pnl_pct = ((current_price - entry_price) / entry_price) * 100
+            pnl_usd = (current_price - entry_price) * total
+            icon = "🟢" if pnl_pct >= 0 else "🔴"
+            line += f"\n  entry (via bot): {entry_price:.6g}  now: {current_price:.6g}  {icon} {pnl_pct:+.1f}% ({pnl_usd:+,.2f}$)"
+        elif entry_price:
+            line += f"\n  entry (via bot): {entry_price:.6g}  (current price unavailable)"
+        else:
+            line += "\n  entry price unknown (not bought through the bot, or predates trade tracking)"
+        lines.append(line)
+    telegram_send("\n".join(lines))
+
+
+def handle_history_command(limit=10):
+    """Handle the /history [N] Telegram command -- shows the N most recent
+    entries from the persisted trade ledger (trades.json): every /buy and
+    /sell placed via the bot (market or limit), plus the eventual
+    filled/cancelled/expired resolution of each limit order. No cap on N
+    beyond what trades.json actually holds (record_trade keeps at most the
+    last 500) -- these are real commands the user actually issued, not
+    arbitrary data, so there's no reason to arbitrarily truncate what they
+    can review. Doesn't require trading to be enabled to VIEW history --
+    only to place new trades -- since this just reads a local file.
+
+    A large N can produce more text than fits in one Telegram message
+    (4096-char hard limit) -- rather than let that silently fail, this
+    batches the output into multiple messages, each safely under the
+    limit."""
+    trades = load_json_file(TRADES_FILE, [])
+    if not trades:
+        telegram_send("📜 No trade history yet.")
+        return
+    recent = trades[-limit:][::-1]  # most recent first
+    entries = []
+    for t in recent:
+        ts = str(t.get("time", "?"))[:16].replace("T", " ")
+        side = t.get("side", "?")
+        kind = t.get("kind", "?")
+        status = t.get("status", "?")
+        product_id = t.get("product_id", "?")
+        price = t.get("price")
+        base_size = t.get("base_size")
+        amount_usd = t.get("amount_usd")
+        price_str = f" @ {price}" if price not in (None, "?") else ""
+        size_str = f" size {base_size}" if base_size not in (None, "?") else ""
+        usd_str = f" (${amount_usd:.2f})" if isinstance(amount_usd, (int, float)) else ""
+        entries.append(
+            f"\n{ts} UTC\n"
+            f"{side} {kind} {product_id} -- {status}{usd_str}{size_str}{price_str}\n"
+            f"order: {t.get('order_id', '?')}"
+        )
+
+    TELEGRAM_SAFE_CHARS = 3500  # comfortably under Telegram's 4096-char message limit
+    header = f"📜 Last {len(entries)} trade record(s):"
+    batch = [header]
+    batch_len = len(header)
+    batch_num = 1
+    for entry in entries:
+        if batch_len + len(entry) > TELEGRAM_SAFE_CHARS and len(batch) > 1:
+            telegram_send("\n".join(batch))
+            batch_num += 1
+            batch = [f"📜 (continued, part {batch_num}):"]
+            batch_len = len(batch[0])
+        batch.append(entry)
+        batch_len += len(entry)
+    telegram_send("\n".join(batch))
+
+
+def handle_stats_command():
+    """Handle the /stats Telegram command -- shows cumulative win/loss/flat
+    counters for breakout ALERTS (not trades placed via the bot -- see
+    /positions and /history for those). Answers "if I'd entered on every
+    breakout signal and exited after EVALUATION_HOURS, how often would that
+    have worked out?" -- purely informational tracking of the scanner's own
+    signal quality. Reads the locally persisted stats.json, no Coinbase API
+    call, so works regardless of whether trading is enabled."""
+    stats = load_json_file(STATS_FILE, {})
+    total = stats.get("total", 0)
+    if total == 0:
+        telegram_send(
+            "📊 No resolved alert outcomes yet.\n"
+            f"(An alert is 'resolved' {EVALUATION_HOURS:.0f}h after it fires, when price is checked again.)"
+        )
+        return
+    win = stats.get("win", 0)
+    loss = stats.get("loss", 0)
+    flat = stats.get("flat", 0)
+    decided = win + loss
+    win_rate = (win / decided * 100) if decided > 0 else 0.0
+    telegram_send(
+        f"📊 Alert track record\n"
+        f"Total resolved: {total}\n"
+        f"Win: {win}   Loss: {loss}   Flat: {flat}\n"
+        f"Win rate (of decided): {win_rate:.0f}%\n"
+        f"(win = price moved +{SUCCESS_THRESHOLD_PCT:.0f}% within {EVALUATION_HOURS:.0f}h of the alert, "
+        f"loss = -{FAILURE_THRESHOLD_PCT:.0f}%, flat = neither)"
+    )
+
+
 def parse_and_handle_command(text):
     """Parse one inbound Telegram message and dispatch it. Every /buy and
     /sell -- market or limit -- executes (or gets placed) directly once
@@ -1010,6 +1252,26 @@ def parse_and_handle_command(text):
             telegram_send("Usage: /cancel ORDER_ID\n(get the ORDER_ID from /orders)")
             return
         handle_cancel_command(parts[1])
+    elif cmd == "/positions":
+        handle_positions_command()
+    elif cmd == "/history":
+        n = 10
+        if len(parts) == 2:
+            try:
+                # No upper cap (requested 2026-08-18: "these are real
+                # commands I issued, no reason to limit it") -- floor of 1
+                # is just to reject nonsense like /history 0 or /history -5.
+                # trades.json itself caps at the most recent 500 (see
+                # record_trade), and handle_history_command batches the
+                # output across multiple Telegram messages if needed, so an
+                # unbounded N can't silently fail or truncate.
+                n = max(1, int(parts[1]))
+            except ValueError:
+                telegram_send(f"N must be a whole number. Got: {parts[1]}")
+                return
+        handle_history_command(n)
+    elif cmd == "/stats":
+        handle_stats_command()
     elif cmd == "/help":
         telegram_send(
             "Commands:\n"
@@ -1020,10 +1282,14 @@ def parse_and_handle_command(text):
             "(the comma before LIMIT_PRICE is optional -- just there to keep the two numbers apart)\n"
             "/orders -- list open (unfilled) limit orders\n"
             "/cancel ORDER_ID -- cancel an open limit order (ORDER_ID from /orders)\n"
-            "/balance -- show free cash and open positions\n"
+            "/balance -- show free cash and open positions (real Coinbase balances)\n"
+            "/positions -- open positions with entry price (via bot) and unrealized P&L\n"
+            "/history [N] -- last N trades placed via the bot (default 10, no upper limit)\n"
+            "/stats -- win/loss track record of breakout ALERTS (not trades)\n"
             "Examples:\n"
             "  /buy BTC-USD 50\n"
             "  /buy BTC-USD 50, 60000\n"
+            "  /history 20\n"
             "Trading is " + ("ENABLED" if TRADING_ENABLED else "DISABLED (no API key set)")
         )
     else:
