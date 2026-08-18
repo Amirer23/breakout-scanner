@@ -751,6 +751,71 @@ def execute_sell(product_id, usd_amount):
         traceback.print_exc()
 
 
+def execute_buy_all(product_id):
+    """Market-buy using the ENTIRE available balance of product_id's QUOTE
+    currency -- e.g. "/buy SOL-USDC all" spends every available USDC on
+    SOL. The quote currency is read straight from product_id (the part
+    after the dash) so this works correctly whether the pair is quoted in
+    USD or USDC -- spending the wrong cash balance would fail with the
+    same "account is not available" error seen with SOL-USD vs SOL-USDC.
+
+    Still enforces MAX_ORDER_USD, same as every other order path -- "buy
+    all" is deliberate, not a typo, but the cash balance could still have
+    grown past the cap since it was set, and the cap exists precisely so
+    no single command can move more than the user has explicitly allowed
+    without raising it first."""
+    quote_currency = product_id.split("-")[1] if "-" in product_id else None
+    if quote_currency not in ("USD", "USDC"):
+        telegram_send(f"❌ BUY ALL failed: {product_id} isn't quoted in USD or USDC -- can't tell which cash balance to spend.")
+        return
+    try:
+        balances = get_balances()
+    except Exception as e:
+        detail = _coinbase_error_detail(e)
+        telegram_send(f"❌ BUY ALL failed: couldn't fetch balances for {product_id}\n{e}{detail}")
+        print(f"  [error] execute_buy_all({product_id}): get_balances failed: {e}{detail}")
+        traceback.print_exc()
+        return
+    match = next((b for b in balances if b[0] == quote_currency), None)
+    if not match or match[1] <= 0:
+        held_note = ""
+        if match and match[2] > 0:
+            held_note = f" ({match[2]:,.2f} {quote_currency} exists but is on hold, e.g. tied up in an open order -- cancel it first with /cancel)"
+        telegram_send(f"❌ BUY ALL failed: no available {quote_currency} balance to spend.{held_note}")
+        return
+    _, available, held = match
+    if available > MAX_ORDER_USD:
+        telegram_send(
+            f"❌ BUY ALL blocked: {available:,.2f} {quote_currency} exceeds the "
+            f"MAX_ORDER_USD safety cap (${MAX_ORDER_USD:,.0f}). Raise it via the Render env var if intentional."
+        )
+        return
+    order_id = str(uuid.uuid4())
+    held_note = f"\n({held:,.2f} {quote_currency} still on hold, not included)" if held > 0 else ""
+    try:
+        resp = _to_dict(_trade_client.market_order_buy(
+            client_order_id=order_id, product_id=product_id, quote_size=str(available)))
+        if resp.get("success"):
+            telegram_send(
+                f"✅ BUY ALL executed: {product_id} -- spent {available:,.2f} {quote_currency}"
+                f"\nOrder ID: {order_id}{held_note}"
+            )
+            filled_size, avg_price = _try_fetch_fill_info(order_id)
+            record_trade({
+                "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
+                "side": "BUY", "kind": "market", "status": "executed",
+                "amount_usd": available, "base_size": filled_size, "price": avg_price,
+                "order_id": order_id,
+            })
+        else:
+            telegram_send(f"❌ BUY ALL failed: {product_id}\n{resp.get('error_response', resp)}")
+    except Exception as e:
+        detail = _coinbase_error_detail(e)
+        telegram_send(f"❌ BUY ALL error: {product_id}\n{e}{detail}")
+        print(f"  [error] buy-all order failed: {e}{detail}")
+        traceback.print_exc()
+
+
 def execute_sell_all(product_id):
     """Market-sell the ENTIRE available balance of product_id's base
     currency -- e.g. "/sell SOL-USDC all" sells every available SOL.
@@ -1279,20 +1344,25 @@ def parse_and_handle_command(text):
                 f"Market (immediate, at current price): {cmd} BTC-USD 50\n"
                 f"Limit (waits until price is reached): {cmd} BTC-USD 50, 60000\n"
                 f"(the comma before the price is optional -- just there to keep the two numbers apart)\n"
-                + ("/sell PRODUCT_ID all -- sell the entire available balance\n" if cmd == "/sell" else "")
+                f"{cmd} PRODUCT_ID all -- {'spend' if cmd == '/buy' else 'sell'} the entire available balance\n"
             )
             return
         product_id = parts[1].upper()
-        # "/sell PRODUCT_ID all" -- sell the whole available balance. This
-        # skips the AMOUNT_USD parsing below entirely: there's no amount to
-        # parse, and execute_sell_all() looks up the real balance straight
-        # from Coinbase rather than working from an estimate.
-        if cmd == "/sell" and len(parts) == 3 and parts[2].lower() == "all":
+        # "/buy PRODUCT_ID all" or "/sell PRODUCT_ID all" -- use the whole
+        # available balance (cash for buy, coin for sell) instead of a
+        # specific USD amount. This skips the AMOUNT_USD parsing below
+        # entirely -- there's no amount to parse, and
+        # execute_buy_all()/execute_sell_all() look up the real balance
+        # straight from Coinbase rather than working from an estimate.
+        if len(parts) == 3 and parts[2].lower() == "all":
             if not TRADING_ENABLED:
                 telegram_send("Trading is not enabled -- COINBASE_API_KEY / COINBASE_API_SECRET are not set on the server.")
                 return
-            telegram_send(f"⏳ Placing SELL ALL order (MARKET): {product_id}...")
-            execute_sell_all(product_id)
+            telegram_send(f"⏳ Placing {cmd[1:].upper()} ALL order (MARKET): {product_id}...")
+            if cmd == "/buy":
+                execute_buy_all(product_id)
+            else:
+                execute_sell_all(product_id)
             return
         # Accept an optional trailing comma on the amount (e.g. "50," from
         # "/buy BTC-USD 50, 60000") purely as a readability aid for
@@ -1361,6 +1431,7 @@ def parse_and_handle_command(text):
             "Commands:\n"
             "/buy PRODUCT_ID AMOUNT_USD -- market buy, spending AMOUNT_USD immediately at the current price\n"
             "/buy PRODUCT_ID AMOUNT_USD, LIMIT_PRICE -- limit buy, waits until price reaches LIMIT_PRICE or better\n"
+            "/buy PRODUCT_ID all -- market buy, spending the entire available cash balance (USD/USDC) for that pair\n"
             "/sell PRODUCT_ID AMOUNT_USD -- market sell, selling ~AMOUNT_USD worth immediately at the current price\n"
             "/sell PRODUCT_ID AMOUNT_USD, LIMIT_PRICE -- limit sell, waits until price reaches LIMIT_PRICE or better\n"
             "/sell PRODUCT_ID all -- market sell the entire available balance of that coin\n"
