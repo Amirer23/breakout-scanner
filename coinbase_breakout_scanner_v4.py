@@ -283,7 +283,7 @@ def drop_incomplete_last_candle(candles):
     return candles
 
 
-def find_price_target(candles, resistance):
+def find_price_target(candles, resistance, last_close):
     """Technical price target for a breakout.
 
     Primary method: scan further back in the already-fetched history (older
@@ -300,6 +300,19 @@ def find_price_target(candles, resistance):
     a guarantee -- treat it as a reference point for a trailing/partial
     exit, not a promise the price will get there.
 
+    Both methods only ever return a price ABOVE last_close (the breakout
+    candle's own close): an old high found further back can sit only
+    marginally above `resistance` (e.g. resistance=88.43, old high=88.44) --
+    close enough that the breakout candle itself, which is what pushed the
+    price past `resistance` in the first place, can already have carried
+    last_close past that old high too. Returning it as-is would print a
+    "target" behind the current price (a negative % move), which is useless
+    as a forward objective and confusing next to an alert that just fired.
+    Confirmed live on 2026-08-17 (AAVE-USD: resistance 88.43, old high
+    88.44, but last_close already at 88.98 -- a target 0.6% *behind* the
+    alert price). Both branches below explicitly filter/extend past
+    last_close so whatever target is returned is always still ahead of it.
+
     Caveat: both methods are limited to whatever history Coinbase's candle
     endpoint returns for this granularity (roughly the last ~300 candles,
     i.e. ~12 days at the default 1h granularity) -- a genuinely older
@@ -309,7 +322,7 @@ def find_price_target(candles, resistance):
     lows = [c[1] for c in candles]
 
     older_highs = highs[: -(LOOKBACK_CANDLES + 1)]
-    higher_levels = [h for h in older_highs if h > resistance]
+    higher_levels = [h for h in older_highs if h > resistance and h > last_close]
     if higher_levels:
         return min(higher_levels), "next_resistance"
 
@@ -318,7 +331,14 @@ def find_price_target(candles, resistance):
     range_height = resistance - range_low
     if range_height <= 0:
         range_height = resistance * (MEASURED_MOVE_FALLBACK_PCT / 100)
-    return resistance + range_height, "measured_move"
+    target = resistance + range_height
+    # Keep projecting the same range height forward until the target clears
+    # last_close -- guards the same edge case for the measured-move branch
+    # (a strong breakout candle can run past resistance + one range-height).
+    # range_height is guaranteed > 0 by this point, so this always terminates.
+    while target <= last_close:
+        target += range_height
+    return target, "measured_move"
 
 
 def analyze(candles):
@@ -377,7 +397,7 @@ def analyze(candles):
 
     target_price, target_pct, target_method = None, None, None
     if signal == "breakout":
-        target_price, target_method = find_price_target(candles, resistance)
+        target_price, target_method = find_price_target(candles, resistance, last_close)
         target_pct = ((target_price - last_close) / last_close) * 100
 
     return {
