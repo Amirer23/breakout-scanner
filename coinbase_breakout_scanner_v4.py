@@ -668,9 +668,25 @@ def _floor_to_precision(value, decimals=8):
     with INSUFFICIENT_FUND, because base_size = 6271.52 / 76.90 rounded
     up in its 8th decimal, making base_size * 76.90 a hair more than the
     $6,271.52 actually available. Flooring instead of rounding guarantees
-    the computed size never costs more than the cash it's derived from."""
+    the computed size never costs more than the cash it's derived from.
+
+    NOTE: this alone turned out not to be enough for GTC limit BUY orders
+    sized off 100% of available cash -- see execute_buy_all()'s shrinking
+    retry loop for the rest of the fix (Coinbase apparently reserves a
+    little more than the bare notional for a resting limit order, most
+    likely fee headroom in case it fills as taker)."""
     factor = 10 ** decimals
     return math.floor(value * factor) / factor
+
+
+def _is_insufficient_funds_error(text):
+    """True if a Coinbase error string indicates a funds/balance shortfall
+    (INSUFFICIENT_FUND, or the human-readable "Insufficient balance...")
+    rather than some other rejection reason. Used to decide whether it's
+    worth retrying an order with a smaller amount, versus surfacing the
+    error immediately."""
+    upper = text.upper()
+    return "INSUFFICIENT_FUND" in upper or "INSUFFICIENT BALANCE" in upper
 
 
 def _coinbase_error_detail(e):
@@ -818,33 +834,65 @@ def execute_buy_all(product_id, limit_price=None):
         # Limit buy: reserve the whole cash balance as base_size at
         # limit_price, exactly like execute_buy_limit() but sized from the
         # full available balance instead of a specified usd_amount.
-        # Floor (not round) so the reserved cost never exceeds `available`
-        # -- see _floor_to_precision()'s docstring for the live incident
-        # this fixes.
-        base_size = _floor_to_precision(available / limit_price)
-        try:
-            resp = _to_dict(_trade_client.limit_order_gtc_buy(
-                client_order_id=order_id, product_id=product_id,
-                base_size=f"{base_size:.8f}", limit_price=str(limit_price)))
-            if resp.get("success"):
+        # _floor_to_precision() alone (rounding the notional DOWN instead
+        # of to-nearest) turned out not to be enough -- confirmed live on
+        # 2026-08-18 that Coinbase still rejects a GTC limit buy sized at
+        # exactly 100% of available cash with INSUFFICIENT_FUND, at more
+        # than one price (76.90 and 77.00), ruling out a one-off rounding
+        # fluke. Coinbase appears to reserve a little more than the bare
+        # notional for a resting limit order (most likely fee headroom in
+        # case it fills as taker). Rather than guess a fixed safety-margin
+        # percentage, retry with a slightly smaller slice of the available
+        # cash each time the rejection is specifically INSUFFICIENT_FUND,
+        # until it succeeds or the margin needed becomes implausibly large
+        # (at which point something else is actually wrong).
+        spend_fraction = 1.0
+        last_error_text = None
+        for attempt in range(8):
+            spend = available * spend_fraction
+            base_size = _floor_to_precision(spend / limit_price)
+            attempt_order_id = str(uuid.uuid4())
+            error_text = None
+            try:
+                resp = _to_dict(_trade_client.limit_order_gtc_buy(
+                    client_order_id=attempt_order_id, product_id=product_id,
+                    base_size=f"{base_size:.8f}", limit_price=str(limit_price)))
+            except Exception as e:
+                detail = _coinbase_error_detail(e)
+                error_text = f"{e}{detail}"
+                resp = None
+            if resp is not None and resp.get("success"):
+                margin_note = (
+                    f"\n(reserved {spend:,.2f} of {available:,.2f} {quote_currency} -- "
+                    f"Coinbase needed a small buffer beyond the exact notional)"
+                    if spend_fraction < 1.0 else ""
+                )
                 telegram_send(
-                    f"✅ LIMIT BUY ALL placed: {product_id} ~{available:,.2f} {quote_currency} @ {limit_price}\n"
-                    f"Order ID: {order_id}{held_note}\n"
-                    f"(Stays open until filled or cancelled -- check /orders, cancel with /cancel {order_id})"
+                    f"✅ LIMIT BUY ALL placed: {product_id} ~{spend:,.2f} {quote_currency} @ {limit_price}\n"
+                    f"Order ID: {attempt_order_id}{held_note}{margin_note}\n"
+                    f"(Stays open until filled or cancelled -- check /orders, cancel with /cancel {attempt_order_id})"
                 )
                 record_trade({
                     "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
                     "side": "BUY", "kind": "limit", "status": "placed",
-                    "amount_usd": available, "base_size": f"{base_size:.8f}", "price": limit_price,
-                    "order_id": order_id,
+                    "amount_usd": spend, "base_size": f"{base_size:.8f}", "price": limit_price,
+                    "order_id": attempt_order_id,
                 })
-            else:
-                telegram_send(f"❌ LIMIT BUY ALL failed: {product_id} ~{available:,.2f} {quote_currency} @ {limit_price}\n{resp.get('error_response', resp)}")
-        except Exception as e:
-            detail = _coinbase_error_detail(e)
-            telegram_send(f"❌ LIMIT BUY ALL error: {product_id} ~{available:,.2f} {quote_currency} @ {limit_price}\n{e}{detail}")
-            print(f"  [error] limit buy-all order failed: {e}{detail}")
-            traceback.print_exc()
+                return
+            if error_text is None:
+                error_text = str(resp.get('error_response', resp))
+            if _is_insufficient_funds_error(error_text) and attempt < 7:
+                last_error_text = error_text
+                spend_fraction -= 0.005
+                continue
+            telegram_send(f"❌ LIMIT BUY ALL failed: {product_id} ~{spend:,.2f} {quote_currency} @ {limit_price}\n{error_text}")
+            print(f"  [error] limit buy-all order failed: {error_text}")
+            return
+        telegram_send(
+            f"❌ LIMIT BUY ALL failed: {product_id} -- still INSUFFICIENT_FUND after retrying down to "
+            f"{spend_fraction * 100:.1f}% of available balance ({available:,.2f} {quote_currency}). "
+            f"Last error: {last_error_text}"
+        )
         return
 
     try:
