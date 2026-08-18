@@ -222,8 +222,17 @@ def fetch_products():
     return sorted(out)
 
 
-def fetch_candles(product_id):
-    data = get_json(f"/products/{product_id}/candles", params={"granularity": GRANULARITY_SECONDS})
+def fetch_candles(product_id, granularity=None):
+    """granularity defaults to GRANULARITY_SECONDS (the main scan's hourly
+    resolution). Pass a different value -- e.g. 86400 for daily candles --
+    to pull a much longer window of history for a specific one-off purpose
+    (see enhance_breakout_target) without touching the main scan's
+    resolution or cadence. Coinbase's candle endpoint returns roughly the
+    same ~300-candle cap regardless of granularity, so daily candles cover
+    ~300 days versus the ~12 days hourly candles cover for the same request."""
+    if granularity is None:
+        granularity = GRANULARITY_SECONDS
+    data = get_json(f"/products/{product_id}/candles", params={"granularity": granularity})
     if not data or not isinstance(data, list):
         return None
     # Coinbase returns newest-first: [time, low, high, open, close, volume]
@@ -1064,6 +1073,48 @@ def telegram_polling_loop():
 # Main scan loop
 # ----------------------------------------------------------------------------
 
+def enhance_breakout_target(product_id, result):
+    """Called only on a brand-new breakout event (see run_cycle) -- never on
+    every cycle for every pair, and never for 'watching' signals.
+
+    The main scan runs on hourly candles so it can catch a breakout within
+    minutes of it happening (see the module docstring for why). The
+    trade-off: Coinbase's candle endpoint caps out at ~300 candles per
+    request, so hourly candles only cover ~12 days of history -- nowhere
+    near enough to find a genuinely significant older resistance level
+    (requested 2026-08-18, after a target search that only had 12 days to
+    work with).
+
+    Fix: since this only runs once per actual breakout (rare, compared to
+    scanning ~400 pairs every 5 minutes), it's cheap to make one extra
+    API call here -- for this one symbol only -- at DAILY granularity,
+    which covers roughly the last ~300 days for the same ~300-candle cap.
+    Re-run the 'next resistance' search against that much wider window; if
+    it finds a real level (above both the local resistance and the current
+    price), it replaces the shorter-sighted target analyze() already
+    computed. If it doesn't find anything, or the extra fetch fails for any
+    reason, the caller just keeps the existing, already-valid target from
+    analyze() -- this is a best-effort improvement, never a requirement for
+    the alert to fire."""
+    try:
+        daily_candles = fetch_candles(product_id, granularity=86400)
+        time.sleep(REQUEST_PACING_SECONDS)
+        if not daily_candles:
+            return result
+        resistance = result["resistance"]
+        last_close = result["last_close"]
+        daily_highs = [c[2] for c in daily_candles]
+        higher_levels = [h for h in daily_highs if h > resistance and h > last_close]
+        if higher_levels:
+            target_price = min(higher_levels)
+            result["target_price"] = target_price
+            result["target_method"] = "next_resistance"
+            result["target_pct"] = ((target_price - last_close) / last_close) * 100
+    except Exception as e:
+        print(f"  [error] enhance_breakout_target({product_id}) failed -- keeping short-history target: {e}")
+    return result
+
+
 def run_cycle(products, state, outcomes):
     for i, product_id in enumerate(products):
         try:
@@ -1082,6 +1133,8 @@ def run_cycle(products, state, outcomes):
 
             # edge-triggered: only alert on a fresh transition INTO breakout/watching
             if new_signal in ("breakout", "watching") and new_signal != prev_signal:
+                if new_signal == "breakout":
+                    result = enhance_breakout_target(product_id, result)
                 notify(product_id, result)
                 if new_signal == "breakout":
                     record_pending_outcome(outcomes, product_id, result, datetime.now(timezone.utc))
