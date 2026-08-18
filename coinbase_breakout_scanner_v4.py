@@ -719,16 +719,24 @@ def record_trade(entry):
 
 
 def _try_fetch_fill_info(order_id):
-    """Best-effort lookup of an order's filled_size/average_filled_price
-    immediately after placing it. Market orders on Coinbase typically fill
-    within a second or two, so this usually already has real fill data by
-    the time we ask -- but it's purely a nice-to-have for the trade log,
-    never allowed to raise or block the calling function."""
+    """Best-effort lookup of an order's filled_size/average_filled_price/
+    total_fees immediately after placing it. Market orders on Coinbase
+    typically fill within a second or two, so this usually already has
+    real fill data by the time we ask -- but it's purely a nice-to-have
+    for the trade log, never allowed to raise or block the calling
+    function.
+
+    total_fees is exactly what Coinbase charged for this order, in the
+    pair's own quote currency (USD or USDC) -- not converted to EUR or
+    any other account display currency, so it lines up with amount_usd
+    and price everywhere else in the ledger (added 2026-08-18, per
+    request to track real fees paid instead of estimating from the
+    published fee-tier schedule)."""
     try:
         order = _to_dict(_to_dict(_trade_client.get_order(order_id)).get("order", {}))
-        return order.get("filled_size"), order.get("average_filled_price")
+        return order.get("filled_size"), order.get("average_filled_price"), order.get("total_fees")
     except Exception:
-        return None, None
+        return None, None, None
 
 
 def execute_buy(product_id, usd_amount):
@@ -739,12 +747,12 @@ def execute_buy(product_id, usd_amount):
             client_order_id=order_id, product_id=product_id, quote_size=str(usd_amount)))
         if resp.get("success"):
             telegram_send(f"✅ BUY executed: {product_id} for ${usd_amount}\nOrder ID: {order_id}")
-            filled_size, avg_price = _try_fetch_fill_info(order_id)
+            filled_size, avg_price, fee = _try_fetch_fill_info(order_id)
             record_trade({
                 "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
                 "side": "BUY", "kind": "market", "status": "executed",
                 "amount_usd": usd_amount, "base_size": filled_size, "price": avg_price,
-                "order_id": order_id,
+                "fee_usd": fee, "order_id": order_id,
             })
         else:
             telegram_send(f"❌ BUY failed: {product_id} for ${usd_amount}\n{resp.get('error_response', resp)}")
@@ -770,12 +778,12 @@ def execute_sell(product_id, usd_amount):
             client_order_id=order_id, product_id=product_id, base_size=f"{base_size:.8f}"))
         if resp.get("success"):
             telegram_send(f"✅ SELL executed: {product_id} (~${usd_amount})\nOrder ID: {order_id}")
-            filled_size, avg_price = _try_fetch_fill_info(order_id)
+            filled_size, avg_price, fee = _try_fetch_fill_info(order_id)
             record_trade({
                 "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
                 "side": "SELL", "kind": "market", "status": "executed",
                 "amount_usd": usd_amount, "base_size": filled_size or f"{base_size:.8f}", "price": avg_price,
-                "order_id": order_id,
+                "fee_usd": fee, "order_id": order_id,
             })
         else:
             telegram_send(f"❌ SELL failed: {product_id} for ${usd_amount}\n{resp.get('error_response', resp)}")
@@ -903,12 +911,12 @@ def execute_buy_all(product_id, limit_price=None):
                 f"✅ BUY ALL executed: {product_id} -- spent {available:,.2f} {quote_currency}"
                 f"\nOrder ID: {order_id}{held_note}"
             )
-            filled_size, avg_price = _try_fetch_fill_info(order_id)
+            filled_size, avg_price, fee = _try_fetch_fill_info(order_id)
             record_trade({
                 "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
                 "side": "BUY", "kind": "market", "status": "executed",
                 "amount_usd": available, "base_size": filled_size, "price": avg_price,
-                "order_id": order_id,
+                "fee_usd": fee, "order_id": order_id,
             })
         else:
             telegram_send(f"❌ BUY ALL failed: {product_id}\n{resp.get('error_response', resp)}")
@@ -1007,12 +1015,12 @@ def execute_sell_all(product_id, limit_price=None):
                 f"✅ SELL ALL executed: {product_id} -- sold {available:.8g} {base_currency} (~${usd_value:,.2f})"
                 f"\nOrder ID: {order_id}{held_note}"
             )
-            filled_size, avg_price = _try_fetch_fill_info(order_id)
+            filled_size, avg_price, fee = _try_fetch_fill_info(order_id)
             record_trade({
                 "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
                 "side": "SELL", "kind": "market", "status": "executed",
                 "amount_usd": usd_value, "base_size": filled_size or f"{available:.8f}", "price": avg_price,
-                "order_id": order_id,
+                "fee_usd": fee, "order_id": order_id,
             })
         else:
             telegram_send(f"❌ SELL ALL failed: {product_id}\n{resp.get('error_response', resp)}")
@@ -1187,10 +1195,18 @@ def check_order_fills(known_open_ids):
         side = order.get("side", "?")
         filled_size = order.get("filled_size", "?")
         avg_price = order.get("average_filled_price", "?")
+        fee = order.get("total_fees")
         icon = {"FILLED": "✅", "CANCELLED": "🚫", "EXPIRED": "⌛"}.get(status, "ℹ️")
+        fee_note = ""
+        if status == "FILLED" and fee not in (None, ""):
+            try:
+                quote_ccy = product_id.split("-")[1] if "-" in product_id else "USD"
+                fee_note = f"\nFee: {float(fee):.2f} {quote_ccy}"
+            except (TypeError, ValueError):
+                pass
         telegram_send(
             f"{icon} Limit order {status}: {side} {product_id}\n"
-            f"Filled: {filled_size} @ avg {avg_price}\n"
+            f"Filled: {filled_size} @ avg {avg_price}{fee_note}\n"
             f"Order ID: {order_id}"
         )
         # Second ledger entry for this order_id (the first was "placed", from
@@ -1199,7 +1215,7 @@ def check_order_fills(known_open_ids):
         record_trade({
             "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
             "side": side, "kind": "limit", "status": status.lower(),
-            "base_size": filled_size, "price": avg_price, "order_id": order_id,
+            "base_size": filled_size, "price": avg_price, "fee_usd": fee, "order_id": order_id,
         })
 
     return current_open_ids
@@ -1409,12 +1425,19 @@ def handle_history_command(limit=10):
         price = t.get("price")
         base_size = t.get("base_size")
         amount_usd = t.get("amount_usd")
+        fee_usd = t.get("fee_usd")
         price_str = f" @ {price}" if price not in (None, "?") else ""
         size_str = f" size {base_size}" if base_size not in (None, "?") else ""
         usd_str = f" (${amount_usd:.2f})" if isinstance(amount_usd, (int, float)) else ""
+        fee_str = ""
+        if fee_usd not in (None, ""):
+            try:
+                fee_str = f" fee ${float(fee_usd):.2f}"
+            except (TypeError, ValueError):
+                pass
         entries.append(
             f"\n{ts} UTC\n"
-            f"{side} {kind} {product_id} -- {status}{usd_str}{size_str}{price_str}\n"
+            f"{side} {kind} {product_id} -- {status}{usd_str}{size_str}{price_str}{fee_str}\n"
             f"order: {t.get('order_id', '?')}"
         )
 
