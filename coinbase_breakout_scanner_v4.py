@@ -964,11 +964,23 @@ def execute_sell_all(product_id, limit_price=None):
         telegram_send(f"❌ SELL ALL failed: no available {base_currency} balance to sell.{held_note}")
         return
     _, available, held = match
-    price = get_current_price(product_id)
-    if not price:
-        telegram_send(f"❌ SELL ALL failed: couldn't fetch current price for {product_id}")
-        return
-    usd_value = available * price
+    if limit_price:
+        # A limit sell executes at limit_price or better -- that's the
+        # right number for the MAX_ORDER_USD estimate, so there's no need
+        # to also fetch the live market price. Confirmed live on
+        # 2026-08-18: "/sell SOL-USDC all, 77.14" failed outright because
+        # Coinbase's public market-data endpoint (a separate API surface
+        # from the one used to place trades) has no candles listing for
+        # SOL-USDC at all (404) -- even though SOL-USDC trades fine
+        # through the actual trading API. A limit order shouldn't depend
+        # on an endpoint it doesn't actually need.
+        usd_value = available * limit_price
+    else:
+        price = get_current_price(product_id)
+        if not price:
+            telegram_send(f"❌ SELL ALL failed: couldn't fetch current price for {product_id}")
+            return
+        usd_value = available * price
     if usd_value > MAX_ORDER_USD:
         telegram_send(
             f"❌ SELL ALL blocked: {available:.8g} {base_currency} (~${usd_value:,.2f}) exceeds the "
