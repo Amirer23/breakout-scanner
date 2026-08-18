@@ -654,6 +654,25 @@ def get_current_price(product_id):
     return candles[-1][4]
 
 
+def _floor_to_precision(value, decimals=8):
+    """Floor value down to `decimals` decimal places -- used whenever a
+    cash amount (usd_amount, or an entire available cash balance) is
+    converted into a base-currency order size for a LIMIT order, so the
+    resulting notional (base_size * limit_price) can never round UP past
+    the cash amount it's meant to fit inside.
+
+    Plain f-string formatting (f"{x:.8f}") rounds to the NEAREST 8th
+    decimal, which can round up and push the order fractionally over
+    budget. Confirmed live on 2026-08-18: "/buy SOL-USDC all, 76.90"
+    against exactly $6,271.52 available USDC was rejected by Coinbase
+    with INSUFFICIENT_FUND, because base_size = 6271.52 / 76.90 rounded
+    up in its 8th decimal, making base_size * 76.90 a hair more than the
+    $6,271.52 actually available. Flooring instead of rounding guarantees
+    the computed size never costs more than the cash it's derived from."""
+    factor = 10 ** decimals
+    return math.floor(value * factor) / factor
+
+
 def _coinbase_error_detail(e):
     """Best-effort extraction of Coinbase's actual error response body, which
     usually explains WHY a request was rejected (e.g. invalid signature,
@@ -799,7 +818,10 @@ def execute_buy_all(product_id, limit_price=None):
         # Limit buy: reserve the whole cash balance as base_size at
         # limit_price, exactly like execute_buy_limit() but sized from the
         # full available balance instead of a specified usd_amount.
-        base_size = available / limit_price
+        # Floor (not round) so the reserved cost never exceeds `available`
+        # -- see _floor_to_precision()'s docstring for the live incident
+        # this fixes.
+        base_size = _floor_to_precision(available / limit_price)
         try:
             resp = _to_dict(_trade_client.limit_order_gtc_buy(
                 client_order_id=order_id, product_id=product_id,
@@ -961,7 +983,10 @@ def execute_buy_limit(product_id, usd_amount, limit_price):
     (not the current market price), since that's the price it will
     actually transact at if/when it fills."""
     order_id = str(uuid.uuid4())
-    base_size = usd_amount / limit_price
+    # Floor (not round) so the reserved cost never exceeds usd_amount --
+    # see _floor_to_precision()'s docstring for why plain rounding can
+    # push a LIMIT order's true cost fractionally over budget.
+    base_size = _floor_to_precision(usd_amount / limit_price)
     try:
         resp = _to_dict(_trade_client.limit_order_gtc_buy(
             client_order_id=order_id, product_id=product_id,
@@ -996,7 +1021,10 @@ def execute_sell_limit(product_id, usd_amount, limit_price):
     is cancelled, unlike a market sell. usd_amount is converted to a
     base-currency size using limit_price."""
     order_id = str(uuid.uuid4())
-    base_size = usd_amount / limit_price
+    # Floor (not round) so this never asks to sell fractionally more
+    # coin than usd_amount / limit_price implies -- same rounding-up
+    # hazard as the buy side's _floor_to_precision().
+    base_size = _floor_to_precision(usd_amount / limit_price)
     try:
         resp = _to_dict(_trade_client.limit_order_gtc_sell(
             client_order_id=order_id, product_id=product_id,
