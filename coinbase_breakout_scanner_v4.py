@@ -141,6 +141,24 @@ TELEGRAM_OFFSET_FILE = "telegram_offset.json"  # tracks which Telegram messages 
 
 TRADING_ENABLED = bool(COINBASE_API_KEY and COINBASE_API_SECRET)
 _trade_client = None
+
+# Order IDs for limit orders just placed by the Telegram command handler
+# (which runs on its own daemon thread), not yet folded into the main
+# loop's known-open-orders tracking. Needed because a marketable limit
+# order (one whose price already crosses the spread) can fill within a
+# second or two of being placed -- faster than the next scan cycle's
+# check_order_fills() call. Without this, such an order is NEVER seen as
+# "open" by list_orders() before it disappears (already filled), so it
+# never triggers the fill notification at all -- confirmed live on
+# 2026-08-18 with a "/sell SOL-USDC 500, 76.92" limit sell that was
+# marketable at placement and filled immediately, but the user got no
+# Telegram confirmation because check_order_fills() only detects orders
+# that go from open -> gone between two cycles it actually observed.
+# check_order_fills() folds this set into known_open_ids at the start of
+# every cycle so even an instantly-filled order gets caught as "resolved"
+# on the very next check.
+_pending_new_order_ids = set()
+
 if TRADING_ENABLED:
     # Content-free diagnostic: prints ONLY lengths/shape, never the actual
     # key or secret. This exists to catch a very common failure mode --
@@ -886,6 +904,7 @@ def execute_buy_all(product_id, limit_price=None):
                     "amount_usd": spend, "base_size": f"{base_size:.8f}", "price": limit_price,
                     "order_id": attempt_order_id,
                 })
+                _pending_new_order_ids.add(attempt_order_id)
                 return
             if error_text is None:
                 error_text = str(resp.get('error_response', resp))
@@ -1010,6 +1029,7 @@ def execute_sell_all(product_id, limit_price=None):
                     "amount_usd": usd_value, "base_size": f"{available:.8f}", "price": limit_price,
                     "order_id": order_id,
                 })
+                _pending_new_order_ids.add(order_id)
             else:
                 telegram_send(f"❌ LIMIT SELL ALL failed: {product_id} {available:.8g} {base_currency} @ {limit_price}\n{resp.get('error_response', resp)}")
         except Exception as e:
@@ -1075,6 +1095,7 @@ def execute_buy_limit(product_id, usd_amount, limit_price):
                 "amount_usd": usd_amount, "base_size": f"{base_size:.8f}", "price": limit_price,
                 "order_id": order_id,
             })
+            _pending_new_order_ids.add(order_id)
         else:
             telegram_send(f"❌ LIMIT BUY failed: {product_id} ~${usd_amount} @ {limit_price}\n{resp.get('error_response', resp)}")
     except Exception as e:
@@ -1109,6 +1130,7 @@ def execute_sell_limit(product_id, usd_amount, limit_price):
                 "amount_usd": usd_amount, "base_size": f"{base_size:.8f}", "price": limit_price,
                 "order_id": order_id,
             })
+            _pending_new_order_ids.add(order_id)
         else:
             telegram_send(f"❌ LIMIT SELL failed: {product_id} ~${usd_amount} @ {limit_price}\n{resp.get('error_response', resp)}")
     except Exception as e:
@@ -1183,6 +1205,14 @@ def check_order_fills(known_open_ids):
     /orders. Returns the updated set of known-open order IDs to persist."""
     if not TRADING_ENABLED:
         return known_open_ids
+
+    # Pick up any order placed since the last cycle (by the Telegram
+    # command thread) even if it's not in known_open_ids yet -- see
+    # _pending_new_order_ids' docstring for why this matters.
+    if _pending_new_order_ids:
+        known_open_ids = known_open_ids | _pending_new_order_ids
+        _pending_new_order_ids.clear()
+
     try:
         resp = _to_dict(_trade_client.list_orders(order_status=["OPEN"]))
     except Exception as e:
