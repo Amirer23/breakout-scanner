@@ -782,6 +782,14 @@ def execute_buy(product_id, usd_amount):
         resp = _to_dict(_trade_client.market_order_buy(
             client_order_id=order_id, product_id=product_id, quote_size=str(usd_amount)))
         if resp.get("success"):
+            # Coinbase assigns its OWN order_id, separate from the
+            # client_order_id we generated to send the request -- get_order,
+            # list_orders and cancel_orders all key off Coinbase's order_id,
+            # not ours. Using the wrong one here made every fill lookup
+            # silently fail (confirmed live 2026-08-18: check_order_fills
+            # got a 404 "order with this orderID was not found" trying to
+            # look up our client_order_id).
+            order_id = resp.get("order_id") or order_id
             telegram_send(f"✅ BUY executed: {product_id} for ${usd_amount}\nOrder ID: {order_id}")
             filled_size, avg_price, fee = _try_fetch_fill_info(order_id)
             record_trade({
@@ -813,6 +821,10 @@ def execute_sell(product_id, usd_amount):
         resp = _to_dict(_trade_client.market_order_sell(
             client_order_id=order_id, product_id=product_id, base_size=f"{base_size:.8f}"))
         if resp.get("success"):
+            # See execute_buy()'s comment -- use Coinbase's own order_id
+            # from here on, not the client_order_id we generated to place
+            # the order.
+            order_id = resp.get("order_id") or order_id
             telegram_send(f"✅ SELL executed: {product_id} (~${usd_amount})\nOrder ID: {order_id}")
             filled_size, avg_price, fee = _try_fetch_fill_info(order_id)
             record_trade({
@@ -906,6 +918,10 @@ def execute_buy_all(product_id, limit_price=None):
                 error_text = f"{e}{detail}"
                 resp = None
             if resp is not None and resp.get("success"):
+                # Use Coinbase's own order_id from here on -- see
+                # execute_buy()'s comment on why attempt_order_id (our
+                # client_order_id) can't be used for get_order lookups.
+                attempt_order_id = resp.get("order_id") or attempt_order_id
                 margin_note = (
                     f"\n(reserved {spend:,.2f} of {available:,.2f} {quote_currency} -- "
                     f"Coinbase needed a small buffer beyond the exact notional)"
@@ -944,6 +960,7 @@ def execute_buy_all(product_id, limit_price=None):
         resp = _to_dict(_trade_client.market_order_buy(
             client_order_id=order_id, product_id=product_id, quote_size=str(available)))
         if resp.get("success"):
+            order_id = resp.get("order_id") or order_id
             telegram_send(
                 f"✅ BUY ALL executed: {product_id} -- spent {available:,.2f} {quote_currency}"
                 f"\nOrder ID: {order_id}{held_note}"
@@ -1036,6 +1053,13 @@ def execute_sell_all(product_id, limit_price=None):
                 client_order_id=order_id, product_id=product_id,
                 base_size=f"{available:.8f}", limit_price=str(limit_price)))
             if resp.get("success"):
+                # Use Coinbase's own order_id from here on -- see
+                # execute_buy()'s comment for why the client_order_id we
+                # generated to place the order can't be used for get_order
+                # lookups (confirmed live 2026-08-18: this exact order
+                # type -- "/sell ... all, LIMIT" -- 404'd in
+                # check_order_fills because of this mismatch).
+                order_id = resp.get("order_id") or order_id
                 telegram_send(
                     f"✅ LIMIT SELL ALL placed: {product_id} {available:.8g} {base_currency} @ {limit_price}\n"
                     f"Order ID: {order_id}{held_note}\n"
@@ -1061,6 +1085,7 @@ def execute_sell_all(product_id, limit_price=None):
         resp = _to_dict(_trade_client.market_order_sell(
             client_order_id=order_id, product_id=product_id, base_size=f"{available:.8f}"))
         if resp.get("success"):
+            order_id = resp.get("order_id") or order_id
             telegram_send(
                 f"✅ SELL ALL executed: {product_id} -- sold {available:.8g} {base_currency} (~${usd_value:,.2f})"
                 f"\nOrder ID: {order_id}{held_note}"
@@ -1098,6 +1123,11 @@ def execute_buy_limit(product_id, usd_amount, limit_price):
             client_order_id=order_id, product_id=product_id,
             base_size=f"{base_size:.8f}", limit_price=str(limit_price)))
         if resp.get("success"):
+            # Use Coinbase's own order_id from here on -- see
+            # execute_buy()'s comment for why the client_order_id we
+            # generated to place the order can't be used for get_order
+            # lookups.
+            order_id = resp.get("order_id") or order_id
             telegram_send(
                 f"✅ LIMIT BUY placed: {product_id} ~${usd_amount} @ {limit_price}\n"
                 f"Order ID: {order_id}\n"
@@ -1137,6 +1167,11 @@ def execute_sell_limit(product_id, usd_amount, limit_price):
             client_order_id=order_id, product_id=product_id,
             base_size=f"{base_size:.8f}", limit_price=str(limit_price)))
         if resp.get("success"):
+            # Use Coinbase's own order_id from here on -- see
+            # execute_buy()'s comment for why the client_order_id we
+            # generated to place the order can't be used for get_order
+            # lookups.
+            order_id = resp.get("order_id") or order_id
             telegram_send(
                 f"✅ LIMIT SELL placed: {product_id} ~${usd_amount} @ {limit_price}\n"
                 f"Order ID: {order_id}\n"
