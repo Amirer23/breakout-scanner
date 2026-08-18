@@ -84,6 +84,31 @@ WATCHING_VOLUME_RATIO = float(os.environ.get("WATCHING_VOLUME_RATIO", "1.5"))
 WATCHING_RSI_MIN = float(os.environ.get("WATCHING_RSI_MIN", "50"))
 MIN_24H_VOLUME_USD = float(os.environ.get("MIN_24H_VOLUME_USD", "2000000"))  # liquidity floor (was 5,000,000)
 MEASURED_MOVE_FALLBACK_PCT = float(os.environ.get("MEASURED_MOVE_FALLBACK_PCT", "5"))  # NEW: used only if the measured-move range itself is degenerate (near-zero)
+# Confirmed live on 2026-08-18 (PUMP-USD): the nearest older high above
+# resistance can sit just 0.3% away, which is technically "the next
+# resistance" but not something anyone can actually trade around -- too
+# close to leave room for entry/exit or normal noise. find_price_target()
+# now skips any candidate level closer than this and keeps looking (or
+# extends the measured-move projection) so the printed target always
+# represents a real, actionable move, not just the nearest price above
+# last_close.
+MIN_TARGET_PCT = float(os.environ.get("MIN_TARGET_PCT", "1.5"))
+
+# Confirmed live on 2026-08-18 (PRCL-USD: +130% in 24h, RSI 91, still fired
+# a plain BREAKOUT alert with a +4.9% target and no hint that price was
+# already this extended). The breakout criteria above (volume/momentum/
+# close-strength) only look at the SINGLE candle that triggered the signal
+# -- they say nothing about how far price has already run over the last
+# day. Chasing a coin after a >100% day, at RSI 91, is a fundamentally
+# different (much higher reversal-risk) situation than a fresh breakout at
+# RSI 60, even though both pass the same per-candle checks. Rather than
+# silently suppress these (the breakout is real, and blow-off continuations
+# do happen), the alert now surfaces the missing context -- 24h price
+# change is added to every alert, and an explicit warning line is appended
+# when either threshold below is crossed -- so the decision to chase stays
+# with the user, but is now an informed one.
+EXTENDED_MOVE_24H_PCT = float(os.environ.get("EXTENDED_MOVE_24H_PCT", "50"))
+EXTENDED_MOVE_RSI = float(os.environ.get("EXTENDED_MOVE_RSI", "85"))
 
 CYCLE_SLEEP_SECONDS = 300           # 5 minutes between full scan cycles
 REQUEST_PACING_SECONDS = 0.35       # ~3 requests/sec, safely under Coinbase's public rate limit
@@ -374,6 +399,27 @@ def find_price_target(candles, resistance, last_close):
     alert price). Both branches below explicitly filter/extend past
     last_close so whatever target is returned is always still ahead of it.
 
+    Beyond that, both methods also guarantee the RETURNED target clears
+    last_close by at least MIN_TARGET_PCT -- a level that's technically
+    ahead of price but only by a fraction of a percent (e.g. +0.3%) is just
+    as unusable as one behind it as a forward OBJECTIVE; there's no real
+    room for entry/exit or ordinary noise. Confirmed live on 2026-08-18
+    (PUMP-USD: nearest older high only 0.3% above last_close). For
+    next_resistance this means skipping past too-near old highs to the next
+    one that actually clears the bar; for measured_move it means the same
+    range-height projection loop already used to clear last_close also
+    keeps extending until it clears this minimum too.
+
+    IMPORTANT: skipping a too-close old high for the *objective* doesn't
+    make it disappear as an *obstacle* -- price still has to get through it
+    first, and a near ceiling right after a breakout is a real reason a
+    trade can stall or reverse early. Silently dropping it would hide that
+    risk, which is worse than an unhelpful target number (a user asked this
+    directly on 2026-08-18: "how can this be a breakout if the target is
+    only 0.5% away?"). So this also returns near_resistance -- the nearest
+    older high above last_close REGARDLESS of the minimum, or None if there
+    isn't one -- so the caller can flag it explicitly instead of hiding it.
+
     Caveat: both methods are limited to whatever history Coinbase's candle
     endpoint returns for this granularity (roughly the last ~300 candles,
     i.e. ~12 days at the default 1h granularity) -- a genuinely older
@@ -381,11 +427,15 @@ def find_price_target(candles, resistance, last_close):
     """
     highs = [c[2] for c in candles]
     lows = [c[1] for c in candles]
+    min_target_price = last_close * (1 + MIN_TARGET_PCT / 100)
 
     older_highs = highs[: -(LOOKBACK_CANDLES + 1)]
-    higher_levels = [h for h in older_highs if h > resistance and h > last_close]
-    if higher_levels:
-        return min(higher_levels), "next_resistance"
+    all_higher_levels = [h for h in older_highs if h > resistance and h > last_close]
+    near_resistance = min(all_higher_levels) if all_higher_levels else None
+
+    qualifying_levels = [h for h in all_higher_levels if h >= min_target_price]
+    if qualifying_levels:
+        return min(qualifying_levels), "next_resistance", near_resistance
 
     window_lows = lows[-LOOKBACK_CANDLES - 1 : -1]
     range_low = min(window_lows) if window_lows else resistance
@@ -394,12 +444,12 @@ def find_price_target(candles, resistance, last_close):
         range_height = resistance * (MEASURED_MOVE_FALLBACK_PCT / 100)
     target = resistance + range_height
     # Keep projecting the same range height forward until the target clears
-    # last_close -- guards the same edge case for the measured-move branch
-    # (a strong breakout candle can run past resistance + one range-height).
+    # BOTH last_close (a strong breakout candle can run past resistance +
+    # one range-height) AND the minimum actionable distance above it.
     # range_height is guaranteed > 0 by this point, so this always terminates.
-    while target <= last_close:
+    while target <= last_close or target < min_target_price:
         target += range_height
-    return target, "measured_move"
+    return target, "measured_move", near_resistance
 
 
 def analyze(candles):
@@ -441,6 +491,14 @@ def analyze(candles):
     recent = candles[-candles_per_day:]
     daily_volume_usd = sum(c[5] * c[4] for c in recent)  # volume * close, summed
 
+    # 24h price change -- close price ~24h ago vs the current close. Missing
+    # from the alert entirely until 2026-08-18 (see EXTENDED_MOVE_* above);
+    # falls back to the earliest close we actually have if there's less
+    # than a full day of history, same graceful-degradation approach used
+    # elsewhere rather than returning None and dropping the field.
+    close_24h_ago = candles[-candles_per_day - 1][4] if len(candles) > candles_per_day else candles[0][4]
+    pct_change_24h = ((last_close - close_24h_ago) / close_24h_ago * 100) if close_24h_ago else None
+
     breakout_threshold = resistance * (1 + BREAKOUT_BUFFER_PCT / 100)
 
     signal = "neutral"
@@ -457,9 +515,30 @@ def analyze(candles):
         signal = "watching"
 
     target_price, target_pct, target_method = None, None, None
+    near_resistance_price, near_resistance_pct = None, None
     if signal == "breakout":
-        target_price, target_method = find_price_target(candles, resistance, last_close)
+        target_price, target_method, near_resistance_price = find_price_target(
+            candles, resistance, last_close)
         target_pct = ((target_price - last_close) / last_close) * 100
+        if near_resistance_price is not None:
+            near_resistance_pct = ((near_resistance_price - last_close) / last_close) * 100
+            # Only worth flagging separately if it's NOT already the target
+            # we're reporting (i.e. it was actually skipped for being too
+            # close) -- if it cleared the minimum, it just IS target_price,
+            # already visible, no need to repeat it as a second line.
+            if near_resistance_pct >= MIN_TARGET_PCT:
+                near_resistance_price, near_resistance_pct = None, None
+
+    # Flag (never suppress) a signal that fires on top of an already very
+    # extended move -- see EXTENDED_MOVE_* above. Either a large 24h price
+    # change or a deeply overbought RSI is enough on its own to warrant the
+    # warning; a coin can be extended on one axis without the other (e.g. a
+    # huge 24h move that's already cooled off RSI-wise, or a sharp RSI spike
+    # within a smaller 24h range).
+    extended_move = bool(
+        (pct_change_24h is not None and pct_change_24h >= EXTENDED_MOVE_24H_PCT)
+        or (rsi_val is not None and rsi_val >= EXTENDED_MOVE_RSI)
+    )
 
     return {
         "last_close": last_close,
@@ -469,10 +548,14 @@ def analyze(candles):
         "dist_pct": dist_pct,
         "close_position": close_position,
         "daily_volume_usd": daily_volume_usd,
+        "pct_change_24h": pct_change_24h,
+        "extended_move": extended_move,
         "signal": signal,
         "target_price": target_price,
         "target_pct": target_pct,
         "target_method": target_method,
+        "near_resistance_price": near_resistance_price,
+        "near_resistance_pct": near_resistance_pct,
     }
 
 
@@ -628,6 +711,8 @@ def notify(product_id, result):
         f"Close strength: {result['close_position']*100:.0f}%\n"
         f"24h turnover: ${result['daily_volume_usd']:,.0f}"
     )
+    if result.get("pct_change_24h") is not None:
+        text += f"\n24h change: {result['pct_change_24h']:+.1f}%"
     if result["signal"] == "breakout" and result.get("target_price"):
         method_label = (
             "Next resistance target"
@@ -638,12 +723,42 @@ def notify(product_id, result):
             f"\n{method_label}: {result['target_price']:.6g} "
             f"({result['target_pct']:+.1f}% from here)"
         )
+    if result.get("near_resistance_price") is not None:
+        # The nearest older high sits closer than MIN_TARGET_PCT, so it was
+        # skipped as the reported *objective* above -- but it's still a
+        # real obstacle price has to clear first. Surfacing it explicitly
+        # rather than silently dropping it: a user asked directly on
+        # 2026-08-18 whether skipping it made the breakout itself
+        # questionable -- it doesn't (breakout = what already happened,
+        # target = separate forward guess), but hiding a near ceiling
+        # would have been misleading either way.
+        text += (
+            f"\nℹ️ Note: an older high sits just "
+            f"{result['near_resistance_pct']:+.1f}% away at {result['near_resistance_price']:.6g} -- "
+            "may cause an early stall/pullback before the target above."
+        )
+    if result.get("extended_move"):
+        # Confirmed live on 2026-08-18 (PRCL-USD: +130% in 24h, RSI 91) --
+        # the per-candle breakout checks above say nothing about how far
+        # price already ran before this candle. Not a reason to hide the
+        # alert (the breakout itself is real), but a reason to flag it
+        # explicitly: entering here is chasing an already-extended move,
+        # not catching a fresh one, and reversals off overbought spikes can
+        # be sharp and fast.
+        text += (
+            "\n⚠️ Extended move -- price is already up "
+            f"{result.get('pct_change_24h', 0):+.0f}% in 24h with RSI {result['rsi']:.0f}. "
+            "Higher risk of a sharp pullback from here; this is a breakout "
+            "continuation, not a fresh setup."
+        )
 
     print(f"[ALERT] {product_id}: {result['signal'].upper()} "
           f"price={result['last_close']:.4f} resistance={result['resistance']:.4f} "
           f"vol_ratio={result['vol_ratio']:.2f}x rsi={result['rsi']:.0f}"
+          + (f" chg24h={result['pct_change_24h']:+.1f}%" if result.get("pct_change_24h") is not None else "")
           + (f" target={result['target_price']:.4f} ({result['target_pct']:+.1f}%, {result['target_method']})"
-             if result.get("target_price") else ""))
+             if result.get("target_price") else "")
+          + (" EXTENDED" if result.get("extended_move") else ""))
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
