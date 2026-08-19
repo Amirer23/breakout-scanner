@@ -87,12 +87,24 @@ MEASURED_MOVE_FALLBACK_PCT = float(os.environ.get("MEASURED_MOVE_FALLBACK_PCT", 
 # Confirmed live on 2026-08-18 (PUMP-USD): the nearest older high above
 # resistance can sit just 0.3% away, which is technically "the next
 # resistance" but not something anyone can actually trade around -- too
-# close to leave room for entry/exit or normal noise. find_price_target()
+# close to leave room for entry/exit or normal noise. find_price_targets()
 # now skips any candidate level closer than this and keeps looking (or
 # extends the measured-move projection) so the printed target always
 # represents a real, actionable move, not just the nearest price above
 # last_close.
 MIN_TARGET_PCT = float(os.environ.get("MIN_TARGET_PCT", "1.5"))
+
+# How many distinct resistance levels to surface per breakout (2026-08-19,
+# after Amir asked for multiple targets instead of just the nearest one --
+# useful for planning a partial exit at the near level vs letting the rest
+# run to a further one). TARGET_DEDUP_PCT keeps them from collapsing into
+# near-duplicates: two old highs from adjacent candles often sit within a
+# few cents of each other (confirmed on real LINK-USD daily data: two highs
+# 10.023 and 10.024, effectively the same level) -- a candidate only counts
+# as a NEW target if it's at least this far above the previously accepted
+# one, so "3 targets" always means 3 meaningfully different price zones.
+TARGET_LEVELS_COUNT = int(os.environ.get("TARGET_LEVELS_COUNT", "3"))
+TARGET_DEDUP_PCT = float(os.environ.get("TARGET_DEDUP_PCT", "0.5"))
 
 # Confirmed live on 2026-08-18 (PRCL-USD: +130% in 24h, RSI 91, still fired
 # a plain BREAKOUT alert with a +4.9% target and no hint that price was
@@ -369,8 +381,27 @@ def drop_incomplete_last_candle(candles):
     return candles
 
 
-def find_price_target(candles, resistance, last_close):
-    """Technical price target for a breakout.
+def _select_target_levels(qualifying_levels_sorted):
+    """From an ascending list of price levels that already clear
+    min_target_price, pick up to TARGET_LEVELS_COUNT of them such that each
+    selected level sits at least TARGET_DEDUP_PCT above the previously
+    selected one. Without this, two old highs from neighboring candles that
+    happen to sit within a few cents of each other (confirmed on real
+    LINK-USD daily data on 2026-08-19: highs of 10.023 and 10.024 from
+    adjacent days) would count as two separate 'targets' when they're
+    really the same resistance zone touched twice. This guarantees N
+    reported targets always means N meaningfully distinct price zones."""
+    selected = []
+    for level in qualifying_levels_sorted:
+        if not selected or (level - selected[-1]) / selected[-1] * 100 >= TARGET_DEDUP_PCT:
+            selected.append(level)
+        if len(selected) >= TARGET_LEVELS_COUNT:
+            break
+    return selected
+
+
+def find_price_targets(candles, resistance, last_close):
+    """Technical price target(s) for a breakout.
 
     Primary method: scan further back in the already-fetched history (older
     than the lookback window used to compute `resistance`) for the next
@@ -423,19 +454,34 @@ def find_price_target(candles, resistance, last_close):
     Caveat: both methods are limited to whatever history Coinbase's candle
     endpoint returns for this granularity (roughly the last ~300 candles,
     i.e. ~12 days at the default 1h granularity) -- a genuinely older
-    resistance level further back than that won't be seen.
+    resistance level further back than that won't be seen. (This is also
+    why enhance_breakout_target() re-runs the next_resistance search below
+    against a wider daily window once a breakout actually fires -- see
+    that function for why 12 days often isn't enough.)
+
+    Returns (targets, method, near_resistance):
+      targets -- a list of up to TARGET_LEVELS_COUNT distinct price levels,
+        ascending (nearest first). Length 1 for measured_move (a single
+        projected level -- see TARGET_LEVELS_COUNT note on why a second/
+        third synthetic projection isn't offered: it would be a multiple of
+        a heuristic, not a second real historical level, and presenting it
+        alongside real levels would be misleading about how grounded it is).
+      method -- "next_resistance" or "measured_move".
+      near_resistance -- nearest older high above last_close REGARDLESS of
+        the minimum, or None if there isn't one (see IMPORTANT note above).
     """
     highs = [c[2] for c in candles]
     lows = [c[1] for c in candles]
     min_target_price = last_close * (1 + MIN_TARGET_PCT / 100)
 
     older_highs = highs[: -(LOOKBACK_CANDLES + 1)]
-    all_higher_levels = [h for h in older_highs if h > resistance and h > last_close]
-    near_resistance = min(all_higher_levels) if all_higher_levels else None
+    all_higher_levels = sorted(set(h for h in older_highs if h > resistance and h > last_close))
+    near_resistance = all_higher_levels[0] if all_higher_levels else None
 
     qualifying_levels = [h for h in all_higher_levels if h >= min_target_price]
-    if qualifying_levels:
-        return min(qualifying_levels), "next_resistance", near_resistance
+    targets = _select_target_levels(qualifying_levels)
+    if targets:
+        return targets, "next_resistance", near_resistance
 
     window_lows = lows[-LOOKBACK_CANDLES - 1 : -1]
     range_low = min(window_lows) if window_lows else resistance
@@ -449,7 +495,7 @@ def find_price_target(candles, resistance, last_close):
     # range_height is guaranteed > 0 by this point, so this always terminates.
     while target <= last_close or target < min_target_price:
         target += range_height
-    return target, "measured_move", near_resistance
+    return [target], "measured_move", near_resistance
 
 
 def analyze(candles):
@@ -514,18 +560,22 @@ def analyze(candles):
           and (rsi_val or 0) > WATCHING_RSI_MIN):
         signal = "watching"
 
-    target_price, target_pct, target_method = None, None, None
+    targets, target_method = [], None
     near_resistance_price, near_resistance_pct = None, None
     if signal == "breakout":
-        target_price, target_method, near_resistance_price = find_price_target(
+        target_levels, target_method, near_resistance_price = find_price_targets(
             candles, resistance, last_close)
-        target_pct = ((target_price - last_close) / last_close) * 100
+        targets = [
+            {"price": t, "pct": ((t - last_close) / last_close) * 100}
+            for t in target_levels
+        ]
         if near_resistance_price is not None:
             near_resistance_pct = ((near_resistance_price - last_close) / last_close) * 100
-            # Only worth flagging separately if it's NOT already the target
-            # we're reporting (i.e. it was actually skipped for being too
-            # close) -- if it cleared the minimum, it just IS target_price,
-            # already visible, no need to repeat it as a second line.
+            # Only worth flagging separately if it's NOT already among the
+            # targets we're reporting (i.e. it was actually skipped for
+            # being too close) -- if it cleared the minimum, it just IS
+            # targets[0], already visible, no need to repeat it as a
+            # second line.
             if near_resistance_pct >= MIN_TARGET_PCT:
                 near_resistance_price, near_resistance_pct = None, None
 
@@ -551,8 +601,7 @@ def analyze(candles):
         "pct_change_24h": pct_change_24h,
         "extended_move": extended_move,
         "signal": signal,
-        "target_price": target_price,
-        "target_pct": target_pct,
+        "targets": targets,
         "target_method": target_method,
         "near_resistance_price": near_resistance_price,
         "near_resistance_pct": near_resistance_pct,
@@ -604,12 +653,17 @@ def save_json_file(path, data):
 def record_pending_outcome(outcomes, product_id, result, now):
     """Called when a NEW breakout alert fires. Schedules a check-back later."""
     key = f"{product_id}|{now.isoformat()}"
+    # Recorded for reference only -- the win/loss verdict itself compares
+    # entry_price against SUCCESS_THRESHOLD_PCT/FAILURE_THRESHOLD_PCT below,
+    # not against the target. Store the nearest of the (now possibly
+    # multiple) targets, same as what used to be the single target_price.
+    nearest_target = result.get("targets") or [{}]
     outcomes[key] = {
         "product_id": product_id,
         "entry_price": result["last_close"],
         "resistance": result["resistance"],
-        "target_price": result.get("target_price"),
-        "target_pct": result.get("target_pct"),
+        "target_price": nearest_target[0].get("price"),
+        "target_pct": nearest_target[0].get("pct"),
         "target_method": result.get("target_method"),
         "alert_time": now.isoformat(),
         "eval_time": (now + timedelta(hours=EVALUATION_HOURS)).isoformat(),
@@ -713,29 +767,45 @@ def notify(product_id, result):
     )
     if result.get("pct_change_24h") is not None:
         text += f"\n24h change: {result['pct_change_24h']:+.1f}%"
-    if result["signal"] == "breakout" and result.get("target_price"):
-        method_label = (
-            "Next resistance target"
-            if result["target_method"] == "next_resistance"
-            else "Measured-move target (no higher resistance in range)"
-        )
-        text += (
-            f"\n{method_label}: {result['target_price']:.6g} "
-            f"({result['target_pct']:+.1f}% from here)"
-        )
+    targets = result.get("targets") or []
+    if result["signal"] == "breakout" and targets:
+        if len(targets) == 1:
+            # Single target -- either the lone next_resistance level found,
+            # or the measured-move fallback (which only ever produces one
+            # projected level, never several -- see find_price_targets()).
+            method_label = (
+                "Next resistance target"
+                if result["target_method"] == "next_resistance"
+                else "Measured-move target (no higher resistance in range)"
+            )
+            text += f"\n{method_label}: {targets[0]['price']:.6g} ({targets[0]['pct']:+.1f}% from here)"
+        else:
+            # Multiple distinct resistance zones found (2026-08-19, added
+            # after Amir asked for more than just the nearest one) -- always
+            # real historical levels here, never measured-move (that method
+            # only ever returns a single synthetic projection).
+            for i, t in enumerate(targets, 1):
+                if i == 1:
+                    label = f"Target {i} (nearest)"
+                elif i == len(targets):
+                    label = f"Target {i} (furthest)"
+                else:
+                    label = f"Target {i}"
+                text += f"\n{label}: {t['price']:.6g} ({t['pct']:+.1f}% from here)"
     if result.get("near_resistance_price") is not None:
         # The nearest older high sits closer than MIN_TARGET_PCT, so it was
-        # skipped as the reported *objective* above -- but it's still a
-        # real obstacle price has to clear first. Surfacing it explicitly
-        # rather than silently dropping it: a user asked directly on
-        # 2026-08-18 whether skipping it made the breakout itself
-        # questionable -- it doesn't (breakout = what already happened,
-        # target = separate forward guess), but hiding a near ceiling
-        # would have been misleading either way.
+        # skipped as a reported *objective* above -- but it's still a real
+        # obstacle price has to clear first. Surfacing it explicitly rather
+        # than silently dropping it: a user asked directly on 2026-08-18
+        # whether skipping it made the breakout itself questionable -- it
+        # doesn't (breakout = what already happened, target = separate
+        # forward guess), but hiding a near ceiling would have been
+        # misleading either way.
+        target_word = "target" if len(targets) <= 1 else "targets"
         text += (
             f"\nℹ️ Note: an older high sits just "
             f"{result['near_resistance_pct']:+.1f}% away at {result['near_resistance_price']:.6g} -- "
-            "may cause an early stall/pullback before the target above."
+            f"may cause an early stall/pullback before the {target_word} above."
         )
     if result.get("extended_move"):
         # Confirmed live on 2026-08-18 (PRCL-USD: +130% in 24h, RSI 91) --
@@ -752,12 +822,12 @@ def notify(product_id, result):
             "continuation, not a fresh setup."
         )
 
+    targets_debug = ",".join(f"{t['price']:.4f}({t['pct']:+.1f}%)" for t in targets)
     print(f"[ALERT] {product_id}: {result['signal'].upper()} "
           f"price={result['last_close']:.4f} resistance={result['resistance']:.4f} "
           f"vol_ratio={result['vol_ratio']:.2f}x rsi={result['rsi']:.0f}"
           + (f" chg24h={result['pct_change_24h']:+.1f}%" if result.get("pct_change_24h") is not None else "")
-          + (f" target={result['target_price']:.4f} ({result['target_pct']:+.1f}%, {result['target_method']})"
-             if result.get("target_price") else "")
+          + (f" targets=[{targets_debug}] ({result['target_method']})" if targets else "")
           + (" EXTENDED" if result.get("extended_move") else ""))
 
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
@@ -1949,8 +2019,19 @@ def enhance_breakout_target(product_id, result):
     daily window (confirmed live: XLM-USD, analyze() correctly skipped a
     +0.4% level, then this function put it right back as the reported
     target). Now applies the exact same min_target_price filter as
-    find_price_target(), and treats a too-close daily high as a
-    near_resistance obstacle update (never hidden) rather than a target."""
+    find_price_targets(), and treats a too-close daily high as a
+    near_resistance obstacle update (never hidden) rather than a target.
+
+    Extended same day (2026-08-19): Amir asked for up to TARGET_LEVELS_COUNT
+    distinct resistance levels per breakout, always measured on this wider
+    daily window rather than the ~12-day hourly one analyze() uses ("שיאים
+    צריכים להימדד לפי נראה יומי, 300 יום") -- so this function is now the
+    authoritative source for result["targets"] whenever it finds ANY
+    qualifying daily level, replacing analyze()'s shorter-sighted list
+    wholesale rather than only its single nearest target. Uses the same
+    _select_target_levels() dedup helper as find_price_targets() so two
+    near-duplicate old highs from neighboring days (confirmed live on
+    LINK-USD: 10.023 and 10.024) still collapse into one zone."""
     try:
         daily_candles = fetch_candles(product_id, granularity=86400)
         time.sleep(REQUEST_PACING_SECONDS)
@@ -1960,33 +2041,49 @@ def enhance_breakout_target(product_id, result):
         last_close = result["last_close"]
         min_target_price = last_close * (1 + MIN_TARGET_PCT / 100)
         daily_highs = [c[2] for c in daily_candles]
-        higher_levels = [h for h in daily_highs if h > resistance and h > last_close]
+        higher_levels = sorted(set(h for h in daily_highs if h > resistance and h > last_close))
         if higher_levels:
-            daily_near_resistance = min(higher_levels)
+            daily_near_resistance = higher_levels[0]
             qualifying_levels = [h for h in higher_levels if h >= min_target_price]
-            if qualifying_levels:
-                target_price = min(qualifying_levels)
-                result["target_price"] = target_price
+            new_targets = _select_target_levels(qualifying_levels)
+            if new_targets:
+                result["targets"] = [
+                    {"price": t, "pct": ((t - last_close) / last_close) * 100}
+                    for t in new_targets
+                ]
                 result["target_method"] = "next_resistance"
-                result["target_pct"] = ((target_price - last_close) / last_close) * 100
-                # The wider daily search is a superset of what analyze() saw,
-                # so its near_resistance (if any qualifying target found here
-                # too) is more complete -- keep the existing near_resistance
-                # note only if it's still nearer than the new target itself.
-                if (result.get("near_resistance_price") is not None
-                        and result["near_resistance_price"] >= target_price):
-                    result["near_resistance_price"] = None
-                    result["near_resistance_pct"] = None
-            else:
-                # Nothing in the wider window clears the minimum either --
-                # keep analyze()'s existing target, but the daily search may
-                # have found a nearer obstacle than the hourly one did (or
-                # analyze() may not have found one at all). Never hide it.
+
+            # near_resistance handling is independent of whether qualifying
+            # targets were found above: a coin can have BOTH a too-close
+            # daily high (an obstacle, not a target) AND a real further-out
+            # target at the same time -- this isn't an either/or.
+            if daily_near_resistance < min_target_price:
+                # The nearest daily high doesn't itself clear the minimum,
+                # so it's not (and never becomes) one of the targets above --
+                # surface it as an obstacle instead, same as analyze() does
+                # for the hourly window. Bug fixed 2026-08-19 (second pass,
+                # same day): the first version of this branch only ran when
+                # NO qualifying level existed anywhere in the daily window,
+                # so a genuine near obstacle sitting right in front of a
+                # real further-out target (confirmed live: LINK-USD, 9.82
+                # sitting 0.4% away with 9.93/10.023/10.079 as real targets
+                # further out) never got surfaced at all -- silently
+                # dropped, exactly the failure mode this feature exists to
+                # avoid. Now runs whenever the nearest level is sub-
+                # threshold, regardless of what else was found further out.
                 daily_near_pct = ((daily_near_resistance - last_close) / last_close) * 100
                 if (result.get("near_resistance_price") is None
                         or daily_near_resistance < result["near_resistance_price"]):
                     result["near_resistance_price"] = daily_near_resistance
                     result["near_resistance_pct"] = daily_near_pct
+            elif (new_targets and result.get("near_resistance_price") is not None
+                    and result["near_resistance_price"] >= new_targets[0]):
+                # The wider daily search's nearest level itself already
+                # qualifies (it IS new_targets[0]) -- any existing
+                # near_resistance note from the narrower hourly window
+                # that's now equal-or-farther than that is redundant.
+                result["near_resistance_price"] = None
+                result["near_resistance_pct"] = None
     except Exception as e:
         print(f"  [error] enhance_breakout_target({product_id}) failed -- keeping short-history target: {e}")
     return result
