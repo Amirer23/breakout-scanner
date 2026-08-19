@@ -51,6 +51,7 @@ import time
 import traceback
 import uuid
 from datetime import datetime, timezone, timedelta
+from decimal import Decimal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
@@ -1142,6 +1143,65 @@ def _floor_to_precision(value, decimals=8):
     return math.floor(value * factor) / factor
 
 
+def get_base_increment(product_id):
+    """Fetch this product's REAL base_increment -- the exact order-size
+    step Coinbase enforces for THIS specific pair (e.g. "0.00000001" for
+    SOL-USDC, but as coarse as "1" for some cheap, high-supply coins like
+    ENA) -- via the same authenticated Advanced Trade client used to place
+    orders (_trade_client.get_product), deliberately NOT the public
+    market-data endpoint (get_json/BASE_URL, the Coinbase Exchange API).
+    That's a different API surface that doesn't even know about every pair
+    the trading API supports -- confirmed live 2026-08-18: SOL-USDC 404'd
+    there while trading fine through _trade_client (see
+    execute_sell_all()'s comment on the same issue for candles). Returns
+    None on any failure so callers fall back to the old flat-8-decimal
+    behavior instead of blocking the trade outright on a lookup hiccup."""
+    try:
+        product = _to_dict(_trade_client.get_product(product_id))
+        increment = product.get("base_increment")
+        return str(increment) if increment else None
+    except Exception as e:
+        print(f"  [warn] get_base_increment({product_id}) failed, falling back to 8-decimal precision: {e}")
+        return None
+
+
+def _floor_to_increment_str(value, increment_str):
+    """Floor `value` DOWN to the nearest multiple of increment_str (a
+    decimal string like "0.01" or "1", as returned by Coinbase's
+    base_increment) and return it as a plain decimal string with exactly
+    that many decimal places -- never more (Coinbase rejects extra
+    decimals with INVALID_SIZE_PRECISION / "Too many decimals in order
+    amount") and never fewer (would silently under-size the order). Uses
+    Decimal throughout rather than float division, to avoid binary-float
+    rounding artifacts landing just past an increment boundary."""
+    increment = Decimal(increment_str)
+    decimals = max(0, -increment.as_tuple().exponent)
+    value_dec = Decimal(str(value))
+    floored = (value_dec // increment) * increment
+    return f"{floored:.{decimals}f}"
+
+
+def _size_str_for_order(value, product_id):
+    """Format `value` (a computed base-currency order size) as the exact
+    string to send to Coinbase for product_id. FLOORS to this pair's real
+    base_increment (via get_base_increment) -- never assumes 8 decimal
+    places, which is only correct for some pairs. Confirmed live
+    2026-08-19: "/buy ENA-USDC all, 0.0905" was rejected with
+    INVALID_SIZE_PRECISION because the old code always formatted
+    base_size to a flat 8 decimals (right for SOL-USDC, wrong for
+    ENA-USDC, whose real base_increment allows far fewer). Falls back to
+    the pre-fix flat-8-decimal floor (_floor_to_precision) only if the
+    increment lookup itself fails (network hiccup) -- degrades to the old
+    behavior for that one order rather than blocking the trade outright.
+    Floors, never rounds, in both paths -- same reasoning as
+    _floor_to_precision(): the resulting notional/balance-sold must never
+    round UP past the cash or balance `value` was computed from."""
+    increment = get_base_increment(product_id)
+    if increment:
+        return _floor_to_increment_str(value, increment)
+    return f"{_floor_to_precision(value):.8f}"
+
+
 def _is_insufficient_funds_error(text):
     """True if a Coinbase error string indicates a funds/balance shortfall
     (INSUFFICIENT_FUND, or the human-readable "Insufficient balance...")
@@ -1243,10 +1303,13 @@ def execute_sell(product_id, usd_amount):
     if not price:
         telegram_send(f"❌ SELL failed: couldn't fetch current price for {product_id}")
         return
-    base_size = usd_amount / price
+    # See _size_str_for_order()'s docstring -- floors to product_id's REAL
+    # base_increment, not a blanket 8 decimals (which fails with
+    # INVALID_SIZE_PRECISION on coarser-precision pairs).
+    base_size_str = _size_str_for_order(usd_amount / price, product_id)
     try:
         resp = _to_dict(_trade_client.market_order_sell(
-            client_order_id=order_id, product_id=product_id, base_size=f"{base_size:.8f}"))
+            client_order_id=order_id, product_id=product_id, base_size=base_size_str))
         if resp.get("success"):
             # See execute_buy()'s comment -- use Coinbase's own order_id
             # from here on, not the client_order_id we generated to place
@@ -1257,7 +1320,7 @@ def execute_sell(product_id, usd_amount):
             record_trade({
                 "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
                 "side": "SELL", "kind": "market", "status": "executed",
-                "amount_usd": usd_amount, "base_size": filled_size or f"{base_size:.8f}", "price": avg_price,
+                "amount_usd": usd_amount, "base_size": filled_size or base_size_str, "price": avg_price,
                 "fee_usd": fee, "order_id": order_id,
             })
         else:
@@ -1329,17 +1392,26 @@ def execute_buy_all(product_id, limit_price=None):
         # cash each time the rejection is specifically INSUFFICIENT_FUND,
         # until it succeeds or the margin needed becomes implausibly large
         # (at which point something else is actually wrong).
+        # Fetch the real base_increment ONCE outside the retry loop (not
+        # once per attempt -- up to 8 attempts would mean up to 8 redundant
+        # lookups of the same, unchanging value). See _size_str_for_order()
+        # for why 8 decimal places can't just be assumed for every pair.
+        increment = get_base_increment(product_id)
         spend_fraction = 1.0
         last_error_text = None
         for attempt in range(8):
             spend = available * spend_fraction
-            base_size = _floor_to_precision(spend / limit_price)
+            raw_size = spend / limit_price
+            base_size_str = (
+                _floor_to_increment_str(raw_size, increment) if increment
+                else f"{_floor_to_precision(raw_size):.8f}"
+            )
             attempt_order_id = str(uuid.uuid4())
             error_text = None
             try:
                 resp = _to_dict(_trade_client.limit_order_gtc_buy(
                     client_order_id=attempt_order_id, product_id=product_id,
-                    base_size=f"{base_size:.8f}", limit_price=str(limit_price)))
+                    base_size=base_size_str, limit_price=str(limit_price)))
             except Exception as e:
                 detail = _coinbase_error_detail(e)
                 error_text = f"{e}{detail}"
@@ -1362,7 +1434,7 @@ def execute_buy_all(product_id, limit_price=None):
                 record_trade({
                     "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
                     "side": "BUY", "kind": "limit", "status": "placed",
-                    "amount_usd": spend, "base_size": f"{base_size:.8f}", "price": limit_price,
+                    "amount_usd": spend, "base_size": base_size_str, "price": limit_price,
                     "order_id": attempt_order_id,
                 })
                 _pending_new_order_ids.add(attempt_order_id)
@@ -1470,6 +1542,12 @@ def execute_sell_all(product_id, limit_price=None):
         return
     order_id = str(uuid.uuid4())
     held_note = f"\n({held:.8g} {base_currency} still on hold, not included)" if held > 0 else ""
+    # See _size_str_for_order()'s docstring -- floors the balance to sell
+    # to product_id's REAL base_increment rather than a blanket 8
+    # decimals, which fails with INVALID_SIZE_PRECISION on coarser pairs.
+    # Computed once and reused below for both the limit and market
+    # branches, since `available` itself doesn't change between them.
+    base_size_str = _size_str_for_order(available, product_id)
 
     if limit_price:
         # Limit sell: the whole available base_size at limit_price, exactly
@@ -1478,7 +1556,7 @@ def execute_sell_all(product_id, limit_price=None):
         try:
             resp = _to_dict(_trade_client.limit_order_gtc_sell(
                 client_order_id=order_id, product_id=product_id,
-                base_size=f"{available:.8f}", limit_price=str(limit_price)))
+                base_size=base_size_str, limit_price=str(limit_price)))
             if resp.get("success"):
                 # Use Coinbase's own order_id from here on -- see
                 # execute_buy()'s comment for why the client_order_id we
@@ -1495,7 +1573,7 @@ def execute_sell_all(product_id, limit_price=None):
                 record_trade({
                     "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
                     "side": "SELL", "kind": "limit", "status": "placed",
-                    "amount_usd": usd_value, "base_size": f"{available:.8f}", "price": limit_price,
+                    "amount_usd": usd_value, "base_size": base_size_str, "price": limit_price,
                     "order_id": order_id,
                 })
                 _pending_new_order_ids.add(order_id)
@@ -1510,7 +1588,7 @@ def execute_sell_all(product_id, limit_price=None):
 
     try:
         resp = _to_dict(_trade_client.market_order_sell(
-            client_order_id=order_id, product_id=product_id, base_size=f"{available:.8f}"))
+            client_order_id=order_id, product_id=product_id, base_size=base_size_str))
         if resp.get("success"):
             order_id = resp.get("order_id") or (resp.get("success_response") or {}).get("order_id") or order_id
             telegram_send(
@@ -1521,7 +1599,7 @@ def execute_sell_all(product_id, limit_price=None):
             record_trade({
                 "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
                 "side": "SELL", "kind": "market", "status": "executed",
-                "amount_usd": usd_value, "base_size": filled_size or f"{available:.8f}", "price": avg_price,
+                "amount_usd": usd_value, "base_size": filled_size or base_size_str, "price": avg_price,
                 "fee_usd": fee, "order_id": order_id,
             })
         else:
@@ -1542,13 +1620,15 @@ def execute_buy_limit(product_id, usd_amount, limit_price):
     actually transact at if/when it fills."""
     order_id = str(uuid.uuid4())
     # Floor (not round) so the reserved cost never exceeds usd_amount --
-    # see _floor_to_precision()'s docstring for why plain rounding can
-    # push a LIMIT order's true cost fractionally over budget.
-    base_size = _floor_to_precision(usd_amount / limit_price)
+    # see _size_str_for_order()'s docstring for why plain rounding, AND a
+    # blanket 8 decimals, can both be wrong (rounding can push a LIMIT
+    # order's true cost fractionally over budget; a flat 8 decimals fails
+    # with INVALID_SIZE_PRECISION on pairs with a coarser real increment).
+    base_size_str = _size_str_for_order(usd_amount / limit_price, product_id)
     try:
         resp = _to_dict(_trade_client.limit_order_gtc_buy(
             client_order_id=order_id, product_id=product_id,
-            base_size=f"{base_size:.8f}", limit_price=str(limit_price)))
+            base_size=base_size_str, limit_price=str(limit_price)))
         if resp.get("success"):
             # Use Coinbase's own order_id from here on -- see
             # execute_buy()'s comment for why the client_order_id we
@@ -1567,7 +1647,7 @@ def execute_buy_limit(product_id, usd_amount, limit_price):
             record_trade({
                 "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
                 "side": "BUY", "kind": "limit", "status": "placed",
-                "amount_usd": usd_amount, "base_size": f"{base_size:.8f}", "price": limit_price,
+                "amount_usd": usd_amount, "base_size": base_size_str, "price": limit_price,
                 "order_id": order_id,
             })
             _pending_new_order_ids.add(order_id)
@@ -1585,14 +1665,15 @@ def execute_sell_limit(product_id, usd_amount, limit_price):
     is cancelled, unlike a market sell. usd_amount is converted to a
     base-currency size using limit_price."""
     order_id = str(uuid.uuid4())
-    # Floor (not round) so this never asks to sell fractionally more
-    # coin than usd_amount / limit_price implies -- same rounding-up
-    # hazard as the buy side's _floor_to_precision().
-    base_size = _floor_to_precision(usd_amount / limit_price)
+    # Floor (not round) so this never asks to sell fractionally more coin
+    # than usd_amount / limit_price implies -- see _size_str_for_order()'s
+    # docstring (same rounding-up hazard as the buy side, plus the
+    # per-pair precision fix).
+    base_size_str = _size_str_for_order(usd_amount / limit_price, product_id)
     try:
         resp = _to_dict(_trade_client.limit_order_gtc_sell(
             client_order_id=order_id, product_id=product_id,
-            base_size=f"{base_size:.8f}", limit_price=str(limit_price)))
+            base_size=base_size_str, limit_price=str(limit_price)))
         if resp.get("success"):
             # Use Coinbase's own order_id from here on -- see
             # execute_buy()'s comment for why the client_order_id we
@@ -1607,7 +1688,7 @@ def execute_sell_limit(product_id, usd_amount, limit_price):
             record_trade({
                 "time": datetime.now(timezone.utc).isoformat(), "product_id": product_id,
                 "side": "SELL", "kind": "limit", "status": "placed",
-                "amount_usd": usd_amount, "base_size": f"{base_size:.8f}", "price": limit_price,
+                "amount_usd": usd_amount, "base_size": base_size_str, "price": limit_price,
                 "order_id": order_id,
             })
             _pending_new_order_ids.add(order_id)
