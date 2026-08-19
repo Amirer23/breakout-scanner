@@ -1935,11 +1935,22 @@ def enhance_breakout_target(product_id, result):
     which covers roughly the last ~300 days for the same ~300-candle cap.
     Re-run the 'next resistance' search against that much wider window; if
     it finds a real level (above both the local resistance and the current
-    price), it replaces the shorter-sighted target analyze() already
-    computed. If it doesn't find anything, or the extra fetch fails for any
-    reason, the caller just keeps the existing, already-valid target from
-    analyze() -- this is a best-effort improvement, never a requirement for
-    the alert to fire."""
+    price) that ALSO clears MIN_TARGET_PCT, it replaces the shorter-sighted
+    target analyze() already computed. If it doesn't find anything -- or
+    finds only levels too close to be an actionable target -- or the extra
+    fetch fails for any reason, the caller just keeps the existing,
+    already-valid target from analyze() -- this is a best-effort
+    improvement, never a requirement for the alert to fire.
+
+    Bug fixed 2026-08-19: this used to overwrite target_price/target_pct
+    unconditionally with the nearest daily high above last_close, with NO
+    MIN_TARGET_PCT check at all -- so a properly-filtered 1.5%+ target from
+    analyze() could get silently replaced by a sub-1% one found in the wider
+    daily window (confirmed live: XLM-USD, analyze() correctly skipped a
+    +0.4% level, then this function put it right back as the reported
+    target). Now applies the exact same min_target_price filter as
+    find_price_target(), and treats a too-close daily high as a
+    near_resistance obstacle update (never hidden) rather than a target."""
     try:
         daily_candles = fetch_candles(product_id, granularity=86400)
         time.sleep(REQUEST_PACING_SECONDS)
@@ -1947,13 +1958,35 @@ def enhance_breakout_target(product_id, result):
             return result
         resistance = result["resistance"]
         last_close = result["last_close"]
+        min_target_price = last_close * (1 + MIN_TARGET_PCT / 100)
         daily_highs = [c[2] for c in daily_candles]
         higher_levels = [h for h in daily_highs if h > resistance and h > last_close]
         if higher_levels:
-            target_price = min(higher_levels)
-            result["target_price"] = target_price
-            result["target_method"] = "next_resistance"
-            result["target_pct"] = ((target_price - last_close) / last_close) * 100
+            daily_near_resistance = min(higher_levels)
+            qualifying_levels = [h for h in higher_levels if h >= min_target_price]
+            if qualifying_levels:
+                target_price = min(qualifying_levels)
+                result["target_price"] = target_price
+                result["target_method"] = "next_resistance"
+                result["target_pct"] = ((target_price - last_close) / last_close) * 100
+                # The wider daily search is a superset of what analyze() saw,
+                # so its near_resistance (if any qualifying target found here
+                # too) is more complete -- keep the existing near_resistance
+                # note only if it's still nearer than the new target itself.
+                if (result.get("near_resistance_price") is not None
+                        and result["near_resistance_price"] >= target_price):
+                    result["near_resistance_price"] = None
+                    result["near_resistance_pct"] = None
+            else:
+                # Nothing in the wider window clears the minimum either --
+                # keep analyze()'s existing target, but the daily search may
+                # have found a nearer obstacle than the hourly one did (or
+                # analyze() may not have found one at all). Never hide it.
+                daily_near_pct = ((daily_near_resistance - last_close) / last_close) * 100
+                if (result.get("near_resistance_price") is None
+                        or daily_near_resistance < result["near_resistance_price"]):
+                    result["near_resistance_price"] = daily_near_resistance
+                    result["near_resistance_pct"] = daily_near_pct
     except Exception as e:
         print(f"  [error] enhance_breakout_target({product_id}) failed -- keeping short-history target: {e}")
     return result
