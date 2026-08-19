@@ -13,15 +13,18 @@ Why this works where the browser artifact couldn't:
 WHAT THIS SCRIPT DOES
   1. Fetches the full list of Coinbase products (trading pairs).
   2. Filters to USD-quoted pairs that are online and tradable.
-  3. For each pair, pulls recent candles and computes:
-       - resistance  = highest high over the lookback window
-       - volume ratio = current candle volume / average volume over lookback
-       - RSI(14)
-       - distance to resistance (%)
-  4. Flags "breakout" (price > resistance + volume + RSI confirmation) and
-     "watching" (approaching resistance) signals.
+  3. Every CYCLE_SLEEP_SECONDS (5 min), pulls recent HOURLY candles per pair
+     and computes resistance / volume ratio / RSI(14) / distance to
+     resistance, flagging "watching" (approaching resistance, OR already
+     cleared it on the hourly close but not yet daily-confirmed).
+  4. Once per UTC calendar day, separately pulls DAILY candles per pair and
+     flags "breakout" ONLY if the full day's close clears its own daily
+     resistance with the same volume/RSI/close-strength confirmation (see
+     DAILY_LOOKBACK_CANDLES / analyze_daily -- added 2026-08-19 so
+     "breakout" means a real daily-confirmed move, not just an hourly poke
+     above a level that can fade back under it before the day ends).
   5. Calls notify() on NEW signals only (edge-triggered, not every cycle),
-     so you don't get spammed while a breakout is ongoing.
+     so you don't get spammed while a breakout/watching state is ongoing.
   6. Sleeps, repeats forever.
 
 WHAT YOU STILL NEED TO DECIDE
@@ -122,6 +125,39 @@ TARGET_DEDUP_PCT = float(os.environ.get("TARGET_DEDUP_PCT", "0.5"))
 EXTENDED_MOVE_24H_PCT = float(os.environ.get("EXTENDED_MOVE_24H_PCT", "50"))
 EXTENDED_MOVE_RSI = float(os.environ.get("EXTENDED_MOVE_RSI", "85"))
 
+# 2026-08-19: Amir compared bot alerts against a professional daily-close
+# technical read and pointed out a real gap -- "BREAKOUT" was firing on an
+# HOURLY close above resistance, but proper TA convention (and the read he
+# shared) only calls it confirmed once a FULL DAY closes above the level;
+# an intraday poke that fades back under it before the day ends is "just an
+# intraday touch", not a breakout. Concretely: NEAR-USD alerted BREAKOUT at
+# an hourly close of 1.7005, while the daily-close bar for confirmation sat
+# at 1.74-1.75 -- two different, both-valid standards, but conflating them
+# under one label was misleading.
+#
+# Fix (discussed and agreed 2026-08-19): split the signal into two
+# independent tracks. The hourly scan (every CYCLE_SLEEP_SECONDS, as
+# before) now only ever produces "watching" as its strongest signal -- an
+# hourly close that used to qualify as "breakout" is now an early
+# heads-up, not a confirmation. "BREAKOUT" is reserved exclusively for
+# analyze_daily(), which runs once per UTC day (see check_and_run_daily_pass
+# in main()) against a FULLY CLOSED daily candle. This keeps the fast,
+# real-time visibility Amir wanted (nothing is silently delayed a full day)
+# while making the "BREAKOUT" label mean what it's supposed to mean.
+#
+# DAILY_LOOKBACK_CANDLES mirrors LOOKBACK_CANDLES (20) but in days instead
+# of hours -- deliberately NOT a full year: this defines the LOCAL swing
+# high that needs to break for a signal to fire, not the coin's long-term
+# ceiling. A year-long lookback would often pick an all-time-high-adjacent
+# level that's unreachable in any relevant timeframe for a coin that's
+# down significantly from its highs (confirmed against real NEAR-USD data:
+# a year back sits near its old $3 range, useless as a near-term trigger).
+# The existing ~300-day daily window used for TARGETS (see
+# find_price_targets/analyze_daily) already covers "how far can this run
+# after breaking" -- a separate question from "what does it need to break
+# in the first place", answered here.
+DAILY_LOOKBACK_CANDLES = int(os.environ.get("DAILY_LOOKBACK_CANDLES", "20"))
+
 CYCLE_SLEEP_SECONDS = 300           # 5 minutes between full scan cycles
 REQUEST_PACING_SECONDS = 0.35       # ~3 requests/sec, safely under Coinbase's public rate limit
 MAX_RETRIES = 3
@@ -145,6 +181,16 @@ def _data_path(filename):
 
 
 STATE_FILE = _data_path("scanner_state.json")   # tracks last signal per symbol, to avoid duplicate alerts
+# Separate signal track for the daily-confirmed breakout check (2026-08-19)
+# -- deliberately its own file, not a field inside STATE_FILE's entries, so
+# a coin's hourly "watching" state and its daily "breakout" state can never
+# collide or overwrite each other; they're independent questions answered
+# on independent schedules.
+DAILY_STATE_FILE = _data_path("daily_scanner_state.json")
+# Persists the last UTC calendar date the once-a-day breakout pass ran, so
+# a restart/redeploy mid-day doesn't re-trigger a full 398-pair daily scan
+# (see check_and_run_daily_pass in main()).
+DAILY_CHECK_MARKER_FILE = _data_path("daily_check_marker.json")
 ALERTS_LOG_FILE = _data_path("alerts_log.jsonl")
 OPEN_ORDERS_STATE_FILE = _data_path("open_orders_state.json")  # which limit order IDs were open last cycle, to detect fills
 TRADES_FILE = _data_path("trades.json")         # ledger of every /buy /sell placed via the bot + limit-order resolutions (requested 2026-08-18, position tracking)
@@ -314,8 +360,8 @@ def fetch_products():
 def fetch_candles(product_id, granularity=None):
     """granularity defaults to GRANULARITY_SECONDS (the main scan's hourly
     resolution). Pass a different value -- e.g. 86400 for daily candles --
-    to pull a much longer window of history for a specific one-off purpose
-    (see enhance_breakout_target) without touching the main scan's
+    to pull a much longer window of history for a specific purpose (see
+    analyze_daily/run_daily_cycle) without touching the main hourly scan's
     resolution or cadence. Coinbase's candle endpoint returns roughly the
     same ~300-candle cap regardless of granularity, so daily candles cover
     ~300 days versus the ~12 days hourly candles cover for the same request."""
@@ -363,7 +409,7 @@ def rsi(closes, period=14):
     return 100 - (100 / (1 + rs))
 
 
-def drop_incomplete_last_candle(candles):
+def drop_incomplete_last_candle(candles, granularity_seconds=None):
     """Coinbase's candle endpoint typically includes the still-forming
     current period as the last entry. Signal generation off a partial
     candle means volume ratio / RSI / close-strength are all computed from
@@ -372,11 +418,18 @@ def drop_incomplete_last_candle(candles):
     in and out of the "breakout" state within one hour (e.g. it clears the
     volume/close-strength bar at minute 40 but not at minute 10), producing
     duplicate alerts and duplicate outcome-tracking entries for one event.
-    Drop it so every signal is based on a fully closed candle."""
+    Drop it so every signal is based on a fully closed candle.
+
+    granularity_seconds defaults to GRANULARITY_SECONDS (the hourly scan's
+    resolution) -- pass 86400 when checking DAILY candles (see
+    analyze_daily/run_daily_cycle, added 2026-08-19), since a still-forming
+    daily bar needs to be judged against a 24h window, not a 1h one."""
+    if granularity_seconds is None:
+        granularity_seconds = GRANULARITY_SECONDS
     if not candles:
         return candles
     last_start = candles[-1][0]
-    if last_start + GRANULARITY_SECONDS > time.time():
+    if last_start + granularity_seconds > time.time():
         return candles[:-1]
     return candles
 
@@ -400,7 +453,7 @@ def _select_target_levels(qualifying_levels_sorted):
     return selected
 
 
-def find_price_targets(candles, resistance, last_close):
+def find_price_targets(candles, resistance, last_close, lookback=None):
     """Technical price target(s) for a breakout.
 
     Primary method: scan further back in the already-fetched history (older
@@ -453,11 +506,11 @@ def find_price_targets(candles, resistance, last_close):
 
     Caveat: both methods are limited to whatever history Coinbase's candle
     endpoint returns for this granularity (roughly the last ~300 candles,
-    i.e. ~12 days at the default 1h granularity) -- a genuinely older
-    resistance level further back than that won't be seen. (This is also
-    why enhance_breakout_target() re-runs the next_resistance search below
-    against a wider daily window once a breakout actually fires -- see
-    that function for why 12 days often isn't enough.)
+    i.e. ~12 days at the default 1h granularity, or ~300 days at daily
+    granularity) -- a genuinely older resistance level further back than
+    that won't be seen. (This is why "breakout" is only ever produced by
+    analyze_daily(), which always calls this with daily candles -- see
+    that function for the ~300-day-window reasoning.)
 
     Returns (targets, method, near_resistance):
       targets -- a list of up to TARGET_LEVELS_COUNT distinct price levels,
@@ -469,12 +522,21 @@ def find_price_targets(candles, resistance, last_close):
       method -- "next_resistance" or "measured_move".
       near_resistance -- nearest older high above last_close REGARDLESS of
         the minimum, or None if there isn't one (see IMPORTANT note above).
+
+    lookback defaults to LOOKBACK_CANDLES (the hourly scan's resistance
+    window) -- pass DAILY_LOOKBACK_CANDLES when calling this against daily
+    candles (see analyze_daily, added 2026-08-19), so "older than the
+    lookback window" means older than the last 20 DAYS, not the last 20
+    HOURS, when it matters which candles count as "older history" to
+    search for further targets.
     """
+    if lookback is None:
+        lookback = LOOKBACK_CANDLES
     highs = [c[2] for c in candles]
     lows = [c[1] for c in candles]
     min_target_price = last_close * (1 + MIN_TARGET_PCT / 100)
 
-    older_highs = highs[: -(LOOKBACK_CANDLES + 1)]
+    older_highs = highs[: -(lookback + 1)]
     all_higher_levels = sorted(set(h for h in older_highs if h > resistance and h > last_close))
     near_resistance = all_higher_levels[0] if all_higher_levels else None
 
@@ -483,7 +545,7 @@ def find_price_targets(candles, resistance, last_close):
     if targets:
         return targets, "next_resistance", near_resistance
 
-    window_lows = lows[-LOOKBACK_CANDLES - 1 : -1]
+    window_lows = lows[-lookback - 1 : -1]
     range_low = min(window_lows) if window_lows else resistance
     range_height = resistance - range_low
     if range_height <= 0:
@@ -547,37 +609,34 @@ def analyze(candles):
 
     breakout_threshold = resistance * (1 + BREAKOUT_BUFFER_PCT / 100)
 
-    signal = "neutral"
+    # 2026-08-19: "breakout" no longer fires from this (hourly) function at
+    # all -- see the DAILY_LOOKBACK_CANDLES note above for why. An hourly
+    # close that used to earn "breakout" here now earns "watching" instead:
+    # still worth an immediate heads-up (that's the whole point of scanning
+    # every 5 minutes), just not yet the confirmed label. watching_reason
+    # distinguishes the two ways a coin can end up "watching" -- notify()
+    # uses it to add a clarifying line rather than presenting both cases
+    # identically.
+    signal, watching_reason = "neutral", None
     if daily_volume_usd < MIN_24H_VOLUME_USD:
         signal = "neutral"  # too thin/illiquid -- never signal regardless of other conditions
     elif (last_close > breakout_threshold
             and vol_ratio and vol_ratio >= BREAKOUT_VOLUME_RATIO
             and (rsi_val or 0) > BREAKOUT_RSI_MIN
             and close_position >= BREAKOUT_CLOSE_POSITION_MIN):
-        signal = "breakout"
+        signal, watching_reason = "watching", "cleared_hourly"
     elif (0 <= dist_pct < WATCHING_DISTANCE_PCT
           and vol_ratio and vol_ratio >= WATCHING_VOLUME_RATIO
           and (rsi_val or 0) > WATCHING_RSI_MIN):
-        signal = "watching"
+        signal, watching_reason = "watching", "approaching"
 
+    # Targets/near-resistance are computed only for a CONFIRMED breakout --
+    # this function can no longer produce one, so these always come back
+    # empty from here now. Left in the returned dict (rather than removed)
+    # so notify() and every other consumer keep working against one
+    # consistent schema regardless of which function produced the result.
     targets, target_method = [], None
     near_resistance_price, near_resistance_pct = None, None
-    if signal == "breakout":
-        target_levels, target_method, near_resistance_price = find_price_targets(
-            candles, resistance, last_close)
-        targets = [
-            {"price": t, "pct": ((t - last_close) / last_close) * 100}
-            for t in target_levels
-        ]
-        if near_resistance_price is not None:
-            near_resistance_pct = ((near_resistance_price - last_close) / last_close) * 100
-            # Only worth flagging separately if it's NOT already among the
-            # targets we're reporting (i.e. it was actually skipped for
-            # being too close) -- if it cleared the minimum, it just IS
-            # targets[0], already visible, no need to repeat it as a
-            # second line.
-            if near_resistance_pct >= MIN_TARGET_PCT:
-                near_resistance_price, near_resistance_pct = None, None
 
     # Flag (never suppress) a signal that fires on top of an already very
     # extended move -- see EXTENDED_MOVE_* above. Either a large 24h price
@@ -601,6 +660,127 @@ def analyze(candles):
         "pct_change_24h": pct_change_24h,
         "extended_move": extended_move,
         "signal": signal,
+        "watching_reason": watching_reason,
+        "targets": targets,
+        "target_method": target_method,
+        "near_resistance_price": near_resistance_price,
+        "near_resistance_pct": near_resistance_pct,
+    }
+
+
+def analyze_daily(daily_candles):
+    """Confirmed-breakout signal on DAILY candle closes (added 2026-08-19,
+    after Amir compared bot alerts against a professional daily-close-based
+    technical read and found the bot's hourly-close "BREAKOUT" label too
+    premature -- an intraday poke that fades back under resistance before
+    the day ends shouldn't count as a breakout. Concretely: NEAR-USD
+    alerted BREAKOUT at an hourly close of 1.7005, while the daily-close
+    bar for confirmation in that outside read sat at 1.74-1.75 -- two
+    different, both-valid standards, but conflating them under one label
+    was misleading. See DAILY_LOOKBACK_CANDLES above for the full design
+    discussion.
+
+    This runs once per UTC day (see check_and_run_daily_pass in main()),
+    completely independent of the hourly analyze() above, which now only
+    ever produces "watching" as its strongest signal -- "breakout" is
+    reserved exclusively for this function.
+
+    Mirrors analyze()'s breakout logic exactly (same volume/RSI/close-
+    strength bars -- these measure conviction, not timeframe, so the same
+    thresholds apply), just on daily bars: resistance is the highest daily
+    high over DAILY_LOOKBACK_CANDLES days, and the signal only fires if the
+    FULL day's close clears it with confirmation. An intraday wick above
+    resistance that closes back under it by the end of the UTC day --
+    exactly Amir's NEAR-USD example -- does NOT fire here, because
+    last_close is the daily close, not any price merely touched during the
+    day.
+
+    Since fetch_candles(granularity=86400) already returns ~300 days in one
+    call, this also finds real target levels (see find_price_targets)
+    directly from that SAME fetch -- no extra API call needed. This makes
+    the old enhance_breakout_target() helper fully redundant: it used to
+    exist specifically to re-fetch a wider daily window AFTER an hourly
+    breakout fired, because the ~12 days hourly candles cover wasn't enough
+    runway to find real further-out targets. Now that "breakout" only ever
+    comes from this function -- which already works from a wide daily
+    fetch in the first place -- that extra re-fetch has nothing left to
+    add, so enhance_breakout_target() was removed 2026-08-19."""
+    if len(daily_candles) < DAILY_LOOKBACK_CANDLES + 2:
+        return None
+
+    closes = [c[4] for c in daily_candles]
+    highs = [c[2] for c in daily_candles]
+    lows = [c[1] for c in daily_candles]
+
+    prior_highs = highs[-DAILY_LOOKBACK_CANDLES - 1 : -1]
+    resistance = max(prior_highs)
+    prior_vols = [c[5] for c in daily_candles[-DAILY_LOOKBACK_CANDLES - 1 : -1]]
+    avg_vol = sum(prior_vols) / len(prior_vols) if prior_vols else 0
+
+    last_close = closes[-1]
+    last_high = highs[-1]
+    last_low = lows[-1]
+    last_vol = daily_candles[-1][5]
+    vol_ratio = (last_vol / avg_vol) if avg_vol > 0 else None
+    rsi_val = rsi(closes, 14)
+    dist_pct = ((resistance - last_close) / last_close) * 100
+
+    candle_range = last_high - last_low
+    close_position = ((last_close - last_low) / candle_range) if candle_range > 0 else 0.0
+
+    # A genuine daily candle's own volume*close IS the day's turnover --
+    # no need to sum multiple bars the way the hourly analyze() does to
+    # approximate 24h from 24 hourly candles.
+    daily_volume_usd = last_vol * last_close
+
+    prev_close = closes[-2]
+    pct_change_24h = ((last_close - prev_close) / prev_close * 100) if prev_close else None
+
+    breakout_threshold = resistance * (1 + BREAKOUT_BUFFER_PCT / 100)
+
+    signal = "neutral"
+    if daily_volume_usd < MIN_24H_VOLUME_USD:
+        signal = "neutral"
+    elif (last_close > breakout_threshold
+            and vol_ratio and vol_ratio >= BREAKOUT_VOLUME_RATIO
+            and (rsi_val or 0) > BREAKOUT_RSI_MIN
+            and close_position >= BREAKOUT_CLOSE_POSITION_MIN):
+        signal = "breakout"
+    # No "watching" tier here by design -- that's exclusively the hourly
+    # job's role; this function only ever answers "did today's daily
+    # candle confirm, yes or no".
+
+    targets, target_method = [], None
+    near_resistance_price, near_resistance_pct = None, None
+    if signal == "breakout":
+        target_levels, target_method, near_resistance_price = find_price_targets(
+            daily_candles, resistance, last_close, lookback=DAILY_LOOKBACK_CANDLES)
+        targets = [
+            {"price": t, "pct": ((t - last_close) / last_close) * 100}
+            for t in target_levels
+        ]
+        if near_resistance_price is not None:
+            near_resistance_pct = ((near_resistance_price - last_close) / last_close) * 100
+            if near_resistance_pct >= MIN_TARGET_PCT:
+                near_resistance_price, near_resistance_pct = None, None
+
+    extended_move = bool(
+        (pct_change_24h is not None and pct_change_24h >= EXTENDED_MOVE_24H_PCT)
+        or (rsi_val is not None and rsi_val >= EXTENDED_MOVE_RSI)
+    )
+
+    return {
+        "last_close": last_close,
+        "resistance": resistance,
+        "vol_ratio": vol_ratio,
+        "rsi": rsi_val,
+        "dist_pct": dist_pct,
+        "close_position": close_position,
+        "daily_volume_usd": daily_volume_usd,
+        "pct_change_24h": pct_change_24h,
+        "extended_move": extended_move,
+        "signal": signal,
+        "watching_reason": None,
         "targets": targets,
         "target_method": target_method,
         "near_resistance_price": near_resistance_price,
@@ -767,6 +947,35 @@ def notify(product_id, result):
     )
     if result.get("pct_change_24h") is not None:
         text += f"\n24h change: {result['pct_change_24h']:+.1f}%"
+    if result.get("watching_reason") == "cleared_hourly":
+        # Distinguishes the two ways a coin can end up "watching" (added
+        # 2026-08-19, alongside the hourly/daily split -- see
+        # DAILY_LOOKBACK_CANDLES above). Without this, a coin that already
+        # cleared resistance on the hourly close looks identical to one
+        # that's merely approaching it, even though the first is a much
+        # stronger signal already awaiting confirmation.
+        #
+        # IMPORTANT: the "Resistance" printed above this line is the HOURLY
+        # level (a 20-HOUR window) that was just cleared -- NOT the level
+        # the eventual daily confirmation check will use. analyze_daily()
+        # independently computes its own resistance from a 20-DAY window,
+        # which is very often meaningfully higher than the hourly one (this
+        # is exactly the gap that motivated this whole redesign -- see the
+        # NEAR-USD example in analyze_daily()'s docstring: hourly close
+        # 1.7005 vs. the real daily bar at 1.74-1.75). Found in adversarial
+        # review 2026-08-19: without this line, this alert reads as "clear
+        # 1.7005 on today's close = BREAKOUT", which is false and would
+        # reproduce the exact confusion this redesign was meant to fix.
+        # Not showing the actual daily number here -- computing it would
+        # require an extra daily-candle fetch for every "watching" coin on
+        # every 5-minute cycle, which doesn't scale across ~400 pairs.
+        text += (
+            "\n⏳ Cleared resistance on the hourly close -- watching for a "
+            "daily close confirmation before this becomes a BREAKOUT. Note: "
+            "daily confirmation is checked against a separately-computed, "
+            "typically HIGHER, 20-day resistance level -- not the hourly "
+            "level shown above."
+        )
     targets = result.get("targets") or []
     if result["signal"] == "breakout" and targets:
         if len(targets) == 1:
@@ -1987,109 +2196,12 @@ def telegram_polling_loop():
 # Main scan loop
 # ----------------------------------------------------------------------------
 
-def enhance_breakout_target(product_id, result):
-    """Called only on a brand-new breakout event (see run_cycle) -- never on
-    every cycle for every pair, and never for 'watching' signals.
-
-    The main scan runs on hourly candles so it can catch a breakout within
-    minutes of it happening (see the module docstring for why). The
-    trade-off: Coinbase's candle endpoint caps out at ~300 candles per
-    request, so hourly candles only cover ~12 days of history -- nowhere
-    near enough to find a genuinely significant older resistance level
-    (requested 2026-08-18, after a target search that only had 12 days to
-    work with).
-
-    Fix: since this only runs once per actual breakout (rare, compared to
-    scanning ~400 pairs every 5 minutes), it's cheap to make one extra
-    API call here -- for this one symbol only -- at DAILY granularity,
-    which covers roughly the last ~300 days for the same ~300-candle cap.
-    Re-run the 'next resistance' search against that much wider window; if
-    it finds a real level (above both the local resistance and the current
-    price) that ALSO clears MIN_TARGET_PCT, it replaces the shorter-sighted
-    target analyze() already computed. If it doesn't find anything -- or
-    finds only levels too close to be an actionable target -- or the extra
-    fetch fails for any reason, the caller just keeps the existing,
-    already-valid target from analyze() -- this is a best-effort
-    improvement, never a requirement for the alert to fire.
-
-    Bug fixed 2026-08-19: this used to overwrite target_price/target_pct
-    unconditionally with the nearest daily high above last_close, with NO
-    MIN_TARGET_PCT check at all -- so a properly-filtered 1.5%+ target from
-    analyze() could get silently replaced by a sub-1% one found in the wider
-    daily window (confirmed live: XLM-USD, analyze() correctly skipped a
-    +0.4% level, then this function put it right back as the reported
-    target). Now applies the exact same min_target_price filter as
-    find_price_targets(), and treats a too-close daily high as a
-    near_resistance obstacle update (never hidden) rather than a target.
-
-    Extended same day (2026-08-19): Amir asked for up to TARGET_LEVELS_COUNT
-    distinct resistance levels per breakout, always measured on this wider
-    daily window rather than the ~12-day hourly one analyze() uses ("שיאים
-    צריכים להימדד לפי נראה יומי, 300 יום") -- so this function is now the
-    authoritative source for result["targets"] whenever it finds ANY
-    qualifying daily level, replacing analyze()'s shorter-sighted list
-    wholesale rather than only its single nearest target. Uses the same
-    _select_target_levels() dedup helper as find_price_targets() so two
-    near-duplicate old highs from neighboring days (confirmed live on
-    LINK-USD: 10.023 and 10.024) still collapse into one zone."""
-    try:
-        daily_candles = fetch_candles(product_id, granularity=86400)
-        time.sleep(REQUEST_PACING_SECONDS)
-        if not daily_candles:
-            return result
-        resistance = result["resistance"]
-        last_close = result["last_close"]
-        min_target_price = last_close * (1 + MIN_TARGET_PCT / 100)
-        daily_highs = [c[2] for c in daily_candles]
-        higher_levels = sorted(set(h for h in daily_highs if h > resistance and h > last_close))
-        if higher_levels:
-            daily_near_resistance = higher_levels[0]
-            qualifying_levels = [h for h in higher_levels if h >= min_target_price]
-            new_targets = _select_target_levels(qualifying_levels)
-            if new_targets:
-                result["targets"] = [
-                    {"price": t, "pct": ((t - last_close) / last_close) * 100}
-                    for t in new_targets
-                ]
-                result["target_method"] = "next_resistance"
-
-            # near_resistance handling is independent of whether qualifying
-            # targets were found above: a coin can have BOTH a too-close
-            # daily high (an obstacle, not a target) AND a real further-out
-            # target at the same time -- this isn't an either/or.
-            if daily_near_resistance < min_target_price:
-                # The nearest daily high doesn't itself clear the minimum,
-                # so it's not (and never becomes) one of the targets above --
-                # surface it as an obstacle instead, same as analyze() does
-                # for the hourly window. Bug fixed 2026-08-19 (second pass,
-                # same day): the first version of this branch only ran when
-                # NO qualifying level existed anywhere in the daily window,
-                # so a genuine near obstacle sitting right in front of a
-                # real further-out target (confirmed live: LINK-USD, 9.82
-                # sitting 0.4% away with 9.93/10.023/10.079 as real targets
-                # further out) never got surfaced at all -- silently
-                # dropped, exactly the failure mode this feature exists to
-                # avoid. Now runs whenever the nearest level is sub-
-                # threshold, regardless of what else was found further out.
-                daily_near_pct = ((daily_near_resistance - last_close) / last_close) * 100
-                if (result.get("near_resistance_price") is None
-                        or daily_near_resistance < result["near_resistance_price"]):
-                    result["near_resistance_price"] = daily_near_resistance
-                    result["near_resistance_pct"] = daily_near_pct
-            elif (new_targets and result.get("near_resistance_price") is not None
-                    and result["near_resistance_price"] >= new_targets[0]):
-                # The wider daily search's nearest level itself already
-                # qualifies (it IS new_targets[0]) -- any existing
-                # near_resistance note from the narrower hourly window
-                # that's now equal-or-farther than that is redundant.
-                result["near_resistance_price"] = None
-                result["near_resistance_pct"] = None
-    except Exception as e:
-        print(f"  [error] enhance_breakout_target({product_id}) failed -- keeping short-history target: {e}")
-    return result
-
-
 def run_cycle(products, state, outcomes):
+    """The fast, continuous hourly pass -- runs every CYCLE_SLEEP_SECONDS
+    (5 min) for all products. Since 2026-08-19, this can only ever produce
+    "neutral" or "watching" -- "breakout" is exclusively decided by
+    run_daily_cycle() below, once per UTC day. See DAILY_LOOKBACK_CANDLES
+    above for why."""
     for i, product_id in enumerate(products):
         try:
             candles = fetch_candles(product_id)
@@ -2102,18 +2214,32 @@ def run_cycle(products, state, outcomes):
             if not result:
                 continue
 
-            prev_signal = state.get(product_id, {}).get("signal", "neutral")
+            prev = state.get(product_id, {})
+            prev_signal = prev.get("signal", "neutral")
+            prev_reason = prev.get("watching_reason")
             new_signal = result["signal"]
+            new_reason = result["watching_reason"]
 
-            # edge-triggered: only alert on a fresh transition INTO breakout/watching
-            if new_signal in ("breakout", "watching") and new_signal != prev_signal:
-                if new_signal == "breakout":
-                    result = enhance_breakout_target(product_id, result)
+            # Edge-triggered on more than just the top-level signal: a coin
+            # that was already "watching" (approaching) BEFORE it clears
+            # resistance would otherwise never get a fresh alert when it
+            # actually clears it, because "signal" stays "watching" both
+            # before and after -- only watching_reason changes, from
+            # "approaching" to "cleared_hourly". That's a materially
+            # stronger event (found during the pre-deploy review requested
+            # 2026-08-19, before this ever hit production) and deserves its
+            # own notification, not silence. Symmetric on the way down too
+            # (cleared_hourly -> approaching) so a real reason-change is
+            # never swallowed, while a same-reason re-check (the common
+            # case, most cycles) still stays silent as before.
+            if new_signal == "watching" and (new_signal != prev_signal or new_reason != prev_reason):
                 notify(product_id, result)
-                if new_signal == "breakout":
-                    record_pending_outcome(outcomes, product_id, result, datetime.now(timezone.utc))
 
-            state[product_id] = {"signal": new_signal, "updated": datetime.now(timezone.utc).isoformat()}
+            state[product_id] = {
+                "signal": new_signal,
+                "watching_reason": new_reason,
+                "updated": datetime.now(timezone.utc).isoformat(),
+            }
 
         except Exception:
             print(f"  [error] unexpected failure on {product_id}")
@@ -2125,12 +2251,107 @@ def run_cycle(products, state, outcomes):
     return state, outcomes
 
 
+def run_daily_cycle(products, daily_state, outcomes):
+    """The CONFIRMED-breakout pass -- runs once per UTC calendar day (see
+    check_and_run_daily_pass in main()), never on the regular 5-minute
+    cycle, against fully-closed DAILY candles for every product.
+
+    Uses its own daily_state dict (persisted separately at
+    DAILY_STATE_FILE) rather than the hourly `state` dict passed to
+    run_cycle() -- a coin's hourly "watching" status and its daily
+    "breakout" status are two independent questions on two independent
+    schedules, and must never be able to overwrite each other.
+
+    This is the ONLY place "breakout" can fire (see analyze_daily) and
+    therefore the only place record_pending_outcome() is called from now --
+    win/loss tracking measures confirmed daily breakouts, same as before,
+    just sourced from here instead of the hourly path.
+
+    Persists daily_state (and outcomes, whenever it changes) to disk
+    INCREMENTALLY, product by product, rather than only once at the end of
+    the full ~400-pair loop. Found in adversarial review 2026-08-19: this
+    loop can take several minutes, and Render can kill/redeploy the process
+    at any point during it (documented elsewhere in this file as something
+    that has actually happened). Without incremental saves, a mid-scan
+    kill loses every in-memory daily_state update from that run -- so on
+    the next boot, check_and_run_daily_pass() (seeing no marker file yet
+    for today) reruns the ENTIRE daily scan, and every coin already
+    notified as BREAKOUT earlier in the interrupted run looks "new" again
+    (its daily_state update never made it to disk), causing a duplicate
+    Telegram alert AND a duplicate record_pending_outcome() entry (silently
+    double-counting that trade in win/loss stats later). Saving after every
+    product bounds the damage from a mid-scan kill to at most the single
+    product being processed at the moment of the crash. save_json_file()
+    writes via temp-file+rename (see its own comment), so these frequent
+    saves are already crash-safe/atomic -- no risk of a half-written file."""
+    for i, product_id in enumerate(products):
+        try:
+            daily_candles = fetch_candles(product_id, granularity=86400)
+            time.sleep(REQUEST_PACING_SECONDS)
+            if not daily_candles:
+                continue
+            daily_candles = drop_incomplete_last_candle(daily_candles, granularity_seconds=86400)
+
+            result = analyze_daily(daily_candles)
+            if not result:
+                continue
+
+            prev_signal = daily_state.get(product_id, {}).get("signal", "neutral")
+            new_signal = result["signal"]
+
+            # edge-triggered: only alert on a fresh transition INTO breakout
+            if new_signal == "breakout" and new_signal != prev_signal:
+                notify(product_id, result)
+                record_pending_outcome(outcomes, product_id, result, datetime.now(timezone.utc))
+                save_json_file(OUTCOMES_FILE, outcomes)
+
+            daily_state[product_id] = {"signal": new_signal, "updated": datetime.now(timezone.utc).isoformat()}
+            save_json_file(DAILY_STATE_FILE, daily_state)
+
+        except Exception:
+            print(f"  [error] unexpected failure on {product_id} (daily)")
+            traceback.print_exc()
+
+        if (i + 1) % 50 == 0:
+            print(f"  ...daily-scanned {i + 1}/{len(products)}")
+
+    return daily_state, outcomes
+
+
+def check_and_run_daily_pass(products, daily_state, outcomes):
+    """Runs run_daily_cycle() at most once per UTC calendar date. Compares
+    today's UTC date against DAILY_CHECK_MARKER_FILE (persisted to disk, so
+    it survives restarts/redeploys within the same day) rather than
+    tracking elapsed time -- this way a redeploy mid-day never re-triggers
+    a full 398-pair daily scan, but a fresh UTC day always gets exactly one
+    run whenever the process next happens to check, even if it was down
+    across the actual midnight rollover.
+
+    First-ever run (no marker file yet) always triggers immediately, so a
+    fresh deploy gets a real daily baseline right away instead of waiting
+    up to 24h for the first confirmed-breakout check."""
+    today_str = datetime.now(timezone.utc).date().isoformat()
+    last_checked = load_json_file(DAILY_CHECK_MARKER_FILE, {}).get("date")
+    if not products or today_str == last_checked:
+        return daily_state, outcomes
+
+    print(f"\n=== New UTC day ({today_str}) -- running daily BREAKOUT check on {len(products)} pairs ===")
+    daily_state, outcomes = run_daily_cycle(products, daily_state, outcomes)
+    save_json_file(DAILY_STATE_FILE, daily_state)
+    save_json_file(DAILY_CHECK_MARKER_FILE, {"date": today_str})
+    print(f"=== Daily BREAKOUT check for {today_str} done ===")
+    return daily_state, outcomes
+
+
 def main():
     print("Coinbase Breakout Scanner starting.")
     print(f"Granularity={GRANULARITY_SECONDS}s  Lookback={LOOKBACK_CANDLES}  Cycle={CYCLE_SLEEP_SECONDS}s")
+    print(f"Daily breakout check: DAILY_LOOKBACK_CANDLES={DAILY_LOOKBACK_CANDLES}d, once per UTC day "
+          f"(\"BREAKOUT\" only ever fires from this daily check now -- the hourly scan tops out at \"watching\")")
     print(f"Outcome tracking: evaluate after {EVALUATION_HOURS}h, win>={SUCCESS_THRESHOLD_PCT}% loss<=-{FAILURE_THRESHOLD_PCT}%")
 
     state = load_state()
+    daily_state = load_json_file(DAILY_STATE_FILE, {})
     outcomes = load_json_file(OUTCOMES_FILE, {})
     stats = load_json_file(STATS_FILE, {})
     known_open_order_ids = set(load_json_file(OPEN_ORDERS_STATE_FILE, []))
@@ -2177,6 +2398,14 @@ def main():
             if products:
                 state, outcomes = run_cycle(products, state, outcomes)
                 save_state(state)
+
+                # Once-per-UTC-day confirmed BREAKOUT check (see
+                # check_and_run_daily_pass) -- a no-op on every cycle except
+                # the first one after the UTC date rolls over, when it runs
+                # a full daily pass over all products. That one cycle will
+                # take noticeably longer (an extra ~398-pair scan); this is
+                # expected, not a hang.
+                daily_state, outcomes = check_and_run_daily_pass(products, daily_state, outcomes)
 
             outcomes, stats = evaluate_pending_outcomes(outcomes, stats, now)
             save_json_file(OUTCOMES_FILE, outcomes)
