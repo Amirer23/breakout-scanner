@@ -110,6 +110,42 @@ MIN_TARGET_PCT = float(os.environ.get("MIN_TARGET_PCT", "1.5"))
 TARGET_LEVELS_COUNT = int(os.environ.get("TARGET_LEVELS_COUNT", "3"))
 TARGET_DEDUP_PCT = float(os.environ.get("TARGET_DEDUP_PCT", "0.5"))
 
+# "Zone tested N times" -- informational-only context added to confirmed
+# BREAKOUT alerts (2026-08-20, per Amir's own SOL-USD chart read: he saw
+# $84-85 as a well-tested support zone, something the bot's model never
+# expressed at all -- resistance/targets are single historical price
+# POINTS, not price BANDS revisited over time). This counts how many
+# distinct times price has previously visited the zone around the
+# breakout's own last_close (NOT around `resistance`/`new_support` -- the
+# old, lower level that was just broken -- because it's the current price
+# zone that matches what a chart-reader is actually looking at, and what
+# produced the real finding on SOL-USD: 6 historical visits to ~$83-86,
+# all within the bot's existing 300-day window). Deliberately does NOT
+# feed into the breakout trigger itself (see analyze_daily/notify -- this
+# is option 1 of two designs discussed with Amir on 2026-08-20; option 2,
+# redefining "resistance" itself around tested zones, is a much bigger
+# change and was explicitly deferred).
+ZONE_TOLERANCE_PCT = float(os.environ.get("ZONE_TOLERANCE_PCT", "1"))  # how wide a band counts as "the same zone" around last_close -- tightened 2026-08-20 per Amir (wants a precise entry level, not a wide zone)
+ZONE_MIN_GAP_DAYS = int(os.environ.get("ZONE_MIN_GAP_DAYS", "5"))  # touches within this many days of each other count as ONE visit, not two
+ZONE_MIN_VISITS = int(os.environ.get("ZONE_MIN_VISITS", "2"))  # suppress the note entirely below this -- a single incidental touch isn't a "tested zone"
+
+# MFI 14 and EMA9/EMA26 (added 2026-08-20, per Amir's outside consultant
+# feedback). Both are informational-only context lines on WATCHING/
+# BREAKOUT alerts, exactly like new_support/zone_visits above -- NEITHER
+# feeds into the breakout/watching trigger logic itself. Thresholds below
+# mirror the consultant's own read: MFI>80 = very high money flow /
+# overbought, MFI<20 = oversold; EMA9>EMA26 = bullish trend context,
+# EMA9<EMA26 = bearish.
+MFI_OVERBOUGHT = float(os.environ.get("MFI_OVERBOUGHT", "80"))
+MFI_OVERSOLD = float(os.environ.get("MFI_OVERSOLD", "20"))
+EMA_FAST_PERIOD = int(os.environ.get("EMA_FAST_PERIOD", "9"))
+EMA_SLOW_PERIOD = int(os.environ.get("EMA_SLOW_PERIOD", "26"))
+
+# Extra 6H-timeframe context (added 2026-08-20, see fetch_6h_context() below
+# for the full rationale -- fetched ONLY at alert time, never on the main
+# per-cycle per-pair loop, to avoid doubling the ~400-pair API load).
+SIX_HOUR_GRANULARITY_SECONDS = 21600
+
 # Confirmed live on 2026-08-18 (PRCL-USD: +130% in 24h, RSI 91, still fired
 # a plain BREAKOUT alert with a +4.9% target and no hint that price was
 # already this extended). The breakout criteria above (volume/momentum/
@@ -410,6 +446,73 @@ def rsi(closes, period=14):
     return 100 - (100 / (1 + rs))
 
 
+def mfi(candles, period=14):
+    """Money Flow Index (added 2026-08-20, per Amir's outside consultant
+    feedback -- see MFI_OVERBOUGHT/MFI_OVERSOLD above). Same "volume-
+    weighted RSI" concept as RSI but folds in volume, not just price: a
+    move on heavy volume moves MFI more than the same move on thin volume.
+
+    Deliberately mirrors rsi()'s exact structure/convention above -- a
+    simple sum over the last `period` candles, not a continuously-smoothed
+    running average -- so the two indicators behave consistently (same
+    "how many candles do I need" guard, same shape of answer) and stay
+    easy to reason about side by side in the same alert.
+
+    candles are the standard [time, low, high, open, close, volume] tuples.
+    Typical price = (low+high+close)/3; a day/hour's raw money flow is
+    typical_price * volume. Uses ">"/"<" (not ">=") when comparing typical
+    prices between periods -- a period whose typical price is EXACTLY
+    unchanged from the prior one contributes to neither side, matching the
+    standard MFI definition (unlike rsi() above, which folds a zero-diff
+    into "gains" via >=0 -- these are different indicators with different
+    conventions, this is intentional, not an inconsistency).
+
+    Returns None if there isn't enough history, or 100.0 if there was no
+    negative money flow at all in the window (mirrors rsi()'s avg_loss==0
+    handling).
+    """
+    if len(candles) < period + 1:
+        return None
+    typical_prices = [(c[1] + c[2] + c[4]) / 3 for c in candles]
+    money_flows = [tp * c[5] for tp, c in zip(typical_prices, candles)]
+    pos_flow, neg_flow = 0.0, 0.0
+    for i in range(len(candles) - period, len(candles)):
+        if typical_prices[i] > typical_prices[i - 1]:
+            pos_flow += money_flows[i]
+        elif typical_prices[i] < typical_prices[i - 1]:
+            neg_flow += money_flows[i]
+    if neg_flow == 0:
+        return 100.0
+    money_ratio = pos_flow / neg_flow
+    return 100 - (100 / (1 + money_ratio))
+
+
+def ema(values, period):
+    """Exponential moving average (added 2026-08-20, for EMA9/EMA26 trend
+    context -- see EMA_FAST_PERIOD/EMA_SLOW_PERIOD above). Standard EMA:
+    seeded with a simple average of the first `period` values, then
+    exponentially weighted forward through the rest of the series.
+
+    Uses ALL available `values` to seed and roll forward (not just the
+    most recent `period`) -- unlike rsi()/mfi() above, an EMA is a
+    genuinely different kind of average: every prior value still has some
+    (decaying) influence on today's EMA, so truncating the input series
+    early would silently bias the result low on precision. In practice
+    this is called with the full daily_candles/candles list already
+    fetched for this pair, which comfortably covers the ~300-day/hour
+    window Coinbase's API returns.
+
+    Returns None if there isn't enough history to seed even one EMA value.
+    """
+    if len(values) < period:
+        return None
+    k = 2 / (period + 1)
+    ema_val = sum(values[:period]) / period
+    for v in values[period:]:
+        ema_val = v * k + ema_val * (1 - k)
+    return ema_val
+
+
 def drop_incomplete_last_candle(candles, granularity_seconds=None):
     """Coinbase's candle endpoint typically includes the still-forming
     current period as the last entry. Signal generation off a partial
@@ -561,6 +664,62 @@ def find_price_targets(candles, resistance, last_close, lookback=None):
     return [target], "measured_move", near_resistance
 
 
+def count_zone_visits(daily_candles, level, tolerance_pct=None, min_gap_days=None):
+    """Count distinct historical "visits" to the price zone around `level`
+    (added 2026-08-20 -- see ZONE_TOLERANCE_PCT above for the full design
+    rationale). Informational only: NOT used anywhere in the breakout
+    trigger logic, and does not change resistance/target calculation.
+
+    A day "touches" the zone if its [low, high] range overlaps the band
+    [level*(1-tolerance_pct%), level*(1+tolerance_pct%)] -- i.e. price was
+    physically in that band at some point during the day, same "any
+    intraday touch counts" standard already used for resistance itself
+    (see analyze_daily's highs = [c[2] for c in daily_candles] comment).
+
+    Consecutive touch-days closer together than min_gap_days are treated
+    as ONE visit (a multi-day stay in the zone, or a slow chop through it,
+    is one "test" of the level -- not N tests for N days it happened to sit
+    there). A gap of more than min_gap_days between touches starts a new
+    visit.
+
+    Deliberately does NOT exclude the most recent candles (an earlier draft
+    mirrored find_price_targets()'s `older_highs = highs[: -(lookback+1)]`
+    convention to avoid double-counting the breakout's own ramp-up -- but
+    that convention exists there to avoid re-finding the SAME level that
+    defines `resistance`. Here the zone checked is around `level`
+    (last_close, the breakout price), a different and usually higher price
+    than resistance, so a genuine separate touch during the recent window
+    would have been silently dropped. Decided with Amir on 2026-08-20:
+    simplest fix is to not exclude anything -- since consecutive touches
+    already collapse into a single visit via min_gap_days, the breakout's
+    own final approach into the zone counts as at most one extra visit, not
+    an inflated number).
+
+    Returns an int (0 if no history overlaps the zone at all, e.g. the
+    breakout is a fresh all-time high with nothing to compare against).
+    """
+    if tolerance_pct is None:
+        tolerance_pct = ZONE_TOLERANCE_PCT
+    if min_gap_days is None:
+        min_gap_days = ZONE_MIN_GAP_DAYS
+
+    band_low = level * (1 - tolerance_pct / 100)
+    band_high = level * (1 + tolerance_pct / 100)
+
+    touch_indices = [
+        i for i, c in enumerate(daily_candles)
+        if c[1] <= band_high and c[2] >= band_low  # c[1]=low, c[2]=high -- day's range overlaps the band
+    ]
+    if not touch_indices:
+        return 0
+
+    visits = 1
+    for prev_i, cur_i in zip(touch_indices, touch_indices[1:]):
+        if cur_i - prev_i > min_gap_days:
+            visits += 1
+    return visits
+
+
 def analyze(candles):
     if len(candles) < LOOKBACK_CANDLES + 2:
         return None
@@ -582,6 +741,17 @@ def analyze(candles):
     vol_ratio = (last_vol / avg_vol) if avg_vol > 0 else None
     rsi_val = rsi(closes, 14)
     dist_pct = ((resistance - last_close) / last_close) * 100
+
+    # MFI 14 and EMA9/EMA26 trend context (added 2026-08-20) -- informational
+    # only, same treatment as new_support/zone_visits below: computed here so
+    # notify() can show them, but never read by the signal/watching_reason
+    # logic above or below this point.
+    mfi_val = mfi(candles, 14)
+    ema_fast = ema(closes, EMA_FAST_PERIOD)
+    ema_slow = ema(closes, EMA_SLOW_PERIOD)
+    ema_trend = None
+    if ema_fast is not None and ema_slow is not None:
+        ema_trend = "bullish" if ema_fast > ema_slow else ("bearish" if ema_fast < ema_slow else "flat")
 
     # Where did this candle close within its own high-low range?
     # 1.0 = closed at the high (strong buyers through the close),
@@ -655,6 +825,10 @@ def analyze(candles):
         "resistance": resistance,
         "vol_ratio": vol_ratio,
         "rsi": rsi_val,
+        "mfi": mfi_val,
+        "ema_fast": ema_fast,
+        "ema_slow": ema_slow,
+        "ema_trend": ema_trend,
         "dist_pct": dist_pct,
         "close_position": close_position,
         "daily_volume_usd": daily_volume_usd,
@@ -666,6 +840,16 @@ def analyze(candles):
         "target_method": target_method,
         "near_resistance_price": near_resistance_price,
         "near_resistance_pct": near_resistance_pct,
+        # This (hourly) function can never produce "breakout" -- see
+        # new_support's note on analyze_daily()'s return dict for what this
+        # field means. Always None here, kept in the schema so notify() and
+        # every other consumer can read result.get("new_support") without
+        # caring which function produced the result.
+        "new_support": None,
+        # Same reasoning as new_support immediately above -- zone_visits is
+        # only ever computed on a confirmed daily breakout (see
+        # count_zone_visits/ZONE_TOLERANCE_PCT above). Always None here.
+        "zone_visits": None,
     }
 
 
@@ -726,6 +910,16 @@ def analyze_daily(daily_candles):
     rsi_val = rsi(closes, 14)
     dist_pct = ((resistance - last_close) / last_close) * 100
 
+    # MFI 14 and EMA9/EMA26 trend context (added 2026-08-20) -- see the
+    # matching block in analyze() above for the full rationale. Same
+    # informational-only treatment: never read by the signal logic below.
+    mfi_val = mfi(daily_candles, 14)
+    ema_fast = ema(closes, EMA_FAST_PERIOD)
+    ema_slow = ema(closes, EMA_SLOW_PERIOD)
+    ema_trend = None
+    if ema_fast is not None and ema_slow is not None:
+        ema_trend = "bullish" if ema_fast > ema_slow else ("bearish" if ema_fast < ema_slow else "flat")
+
     candle_range = last_high - last_low
     close_position = ((last_close - last_low) / candle_range) if candle_range > 0 else 0.0
 
@@ -770,11 +964,45 @@ def analyze_daily(daily_candles):
         or (rsi_val is not None and rsi_val >= EXTENDED_MOVE_RSI)
     )
 
+    # "New support" (added 2026-08-20, per Amir's own chart reading of
+    # SOL-USD): once a breakout is CONFIRMED, classic technical analysis
+    # treats the resistance level that was just broken as the new support
+    # floor on a pullback/retest -- e.g. SOL-USD broke 77.75 resistance,
+    # so 77.75 becomes the level to watch as support going forward. This
+    # is a genuinely different concept from `resistance` (a backward-
+    # looking "what got broken" fact) and from `targets`/near_resistance
+    # (forward-looking ceilings) -- it's the floor. Deliberately just the
+    # bare former-resistance value, not a computed "zone" or range: the
+    # rest of this bot's model is built entirely from precise historical
+    # price points (real highs/lows it found in the candle data), never
+    # visual round-number zones, and there's no principled way to turn a
+    # single number into a defensible range without inventing a buffer
+    # out of nowhere. Only meaningful once a breakout is CONFIRMED (signal
+    # == "breakout") -- before that, the level hasn't actually been
+    # broken yet, so calling it "support" would be premature the same way
+    # calling an hourly clear a "BREAKOUT" was.
+    new_support = resistance if signal == "breakout" else None
+
+    # "Zone tested N times" (added 2026-08-20, option 1 of the two designs
+    # discussed with Amir -- informational only, does NOT feed back into
+    # `signal` above in any way). Checks the zone around last_close (the
+    # breakout price itself), not around resistance/new_support (the old,
+    # lower level just broken) -- see ZONE_TOLERANCE_PCT's comment for why.
+    # Only computed on a confirmed breakout, same as new_support/targets,
+    # and reuses this same already-fetched daily_candles fetch -- no extra
+    # API call. No exclusion window here -- see count_zone_visits()'s
+    # docstring for why that's deliberate.
+    zone_visits = count_zone_visits(daily_candles, last_close) if signal == "breakout" else None
+
     return {
         "last_close": last_close,
         "resistance": resistance,
         "vol_ratio": vol_ratio,
         "rsi": rsi_val,
+        "mfi": mfi_val,
+        "ema_fast": ema_fast,
+        "ema_slow": ema_slow,
+        "ema_trend": ema_trend,
         "dist_pct": dist_pct,
         "close_position": close_position,
         "daily_volume_usd": daily_volume_usd,
@@ -786,7 +1014,58 @@ def analyze_daily(daily_candles):
         "target_method": target_method,
         "near_resistance_price": near_resistance_price,
         "near_resistance_pct": near_resistance_pct,
+        "new_support": new_support,
+        "zone_visits": zone_visits,
     }
+
+
+def fetch_6h_context(product_id):
+    """Extra 6H-timeframe RSI/MFI/EMA9-26 context for a single product
+    (added 2026-08-20, per Amir's outside consultant feedback -- a "4H or
+    6H chart check" alongside the daily/hourly view; Amir chose 6H).
+
+    Deliberately NOT called from run_cycle()/run_daily_cycle()'s main
+    per-product loop, which already does ~400 candle fetches every 5
+    minutes -- adding a second fetch per product there would double that
+    load for zero benefit on the ~399 pairs that never alert. Instead this
+    is called ONLY right before notify() actually fires (see the two call
+    sites in run_cycle/run_daily_cycle), so in practice it runs a handful
+    of times a day -- once per real WATCHING/BREAKOUT alert -- not once per
+    pair per cycle. Same reasoning as new_support/zone_visits: additive
+    context on an alert that's already firing, never a reason to fetch
+    more for pairs that aren't alerting.
+
+    Purely informational -- like every other addition in this section, it
+    is NOT read by analyze()/analyze_daily()'s signal logic at all (it
+    can't be: it's fetched and attached to `result` by the caller AFTER
+    analyze()/analyze_daily() already decided the signal).
+
+    Returns a dict {"rsi": ..., "mfi": ..., "ema_trend": ...} (any of
+    which may be None if there's insufficient 6H history for that specific
+    indicator), or None if the fetch itself fails or returns too few
+    candles to compute anything -- notify() treats None the same as
+    "omit this section", so a transient network hiccup on this SECONDARY
+    fetch degrades gracefully and never blocks the underlying alert.
+    """
+    try:
+        candles = fetch_candles(product_id, granularity=SIX_HOUR_GRANULARITY_SECONDS)
+        if not candles:
+            return None
+        candles = drop_incomplete_last_candle(candles, granularity_seconds=SIX_HOUR_GRANULARITY_SECONDS)
+        if len(candles) < 15:  # need at least period+1 for rsi/mfi to return anything
+            return None
+        closes = [c[4] for c in candles]
+        rsi_val = rsi(closes, 14)
+        mfi_val = mfi(candles, 14)
+        ema_fast = ema(closes, EMA_FAST_PERIOD)
+        ema_slow = ema(closes, EMA_SLOW_PERIOD)
+        ema_trend = None
+        if ema_fast is not None and ema_slow is not None:
+            ema_trend = "bullish" if ema_fast > ema_slow else ("bearish" if ema_fast < ema_slow else "flat")
+        return {"rsi": rsi_val, "mfi": mfi_val, "ema_trend": ema_trend}
+    except Exception as e:
+        print(f"  [warn] fetch_6h_context({product_id}) failed: {e}")
+        return None
 
 
 # ----------------------------------------------------------------------------
@@ -948,6 +1227,44 @@ def notify(product_id, result):
     )
     if result.get("pct_change_24h") is not None:
         text += f"\n24h change: {result['pct_change_24h']:+.1f}%"
+    if result.get("mfi") is not None:
+        # Money Flow Index (added 2026-08-20) -- see MFI_OVERBOUGHT/
+        # MFI_OVERSOLD above. Purely informational, same as RSI already
+        # shown above -- doesn't affect the signal itself. Can be None on a
+        # very thin/newly-listed pair with less history than the 14-period
+        # window needs, hence the guard (unlike RSI, which is guaranteed
+        # non-None by the time notify() runs -- see mfi()'s docstring).
+        mfi_flag = ""
+        if result["mfi"] >= MFI_OVERBOUGHT:
+            mfi_flag = " (overbought)"
+        elif result["mfi"] <= MFI_OVERSOLD:
+            mfi_flag = " (oversold)"
+        text += f"\nMFI: {result['mfi']:.0f}{mfi_flag}"
+    if result.get("ema_trend") is not None:
+        # EMA9/EMA26 trend context (added 2026-08-20) -- same informational
+        # treatment. Can be None if there's less history than EMA_SLOW_PERIOD
+        # (26) candles needs -- see ema()'s docstring.
+        trend_icon = {"bullish": "📈", "bearish": "📉", "flat": "➡️"}.get(result["ema_trend"], "")
+        text += f"\nEMA9/26 trend: {trend_icon} {result['ema_trend']}"
+    ctx_6h = result.get("ctx_6h")
+    if ctx_6h:
+        # Extra 6H-timeframe context (added 2026-08-20) -- see
+        # fetch_6h_context() for why this is attached to `result` by the
+        # CALLER (run_cycle/run_daily_cycle) only at alert time, rather than
+        # being computed inside analyze()/analyze_daily() like everything
+        # else above. Each piece is independently optional (any of the
+        # three can be None on thin 6H history), so build the line from
+        # whichever parts are actually available rather than all-or-nothing.
+        parts = []
+        if ctx_6h.get("rsi") is not None:
+            parts.append(f"RSI {ctx_6h['rsi']:.0f}")
+        if ctx_6h.get("mfi") is not None:
+            parts.append(f"MFI {ctx_6h['mfi']:.0f}")
+        if ctx_6h.get("ema_trend") is not None:
+            trend_icon = {"bullish": "📈", "bearish": "📉", "flat": "➡️"}.get(ctx_6h["ema_trend"], "")
+            parts.append(f"trend {trend_icon} {ctx_6h['ema_trend']}")
+        if parts:
+            text += f"\n6H context: {' · '.join(parts)}"
     if result.get("watching_reason") == "cleared_hourly":
         # Distinguishes the two ways a coin can end up "watching" (added
         # 2026-08-19, alongside the hourly/daily split -- see
@@ -976,6 +1293,26 @@ def notify(product_id, result):
             "daily confirmation is checked against a separately-computed, "
             "typically HIGHER, 20-day resistance level -- not the hourly "
             "level shown above."
+        )
+    if result.get("new_support") is not None:
+        # Classic TA reading (added 2026-08-20, per Amir's own chart read
+        # of SOL-USD): the resistance level that was JUST broken becomes
+        # the new support floor to watch on a pullback/retest. Deliberately
+        # one plain number, not a "zone" -- see analyze_daily()'s
+        # new_support comment for why. Only ever set on a real breakout
+        # (never on "watching"), so this line can't appear before the
+        # level has actually been confirmed broken.
+        text += f"\n🧱 New support (former resistance): {result['new_support']:.6g}"
+    if result.get("zone_visits") is not None and result["zone_visits"] >= ZONE_MIN_VISITS:
+        # Informational-only context (added 2026-08-20, option 1 of the two
+        # designs discussed with Amir) -- purely descriptive, does NOT
+        # affect the breakout trigger above in any way. Suppressed entirely
+        # below ZONE_MIN_VISITS so a single incidental touch doesn't read as
+        # a meaningful "tested zone". See count_zone_visits()/
+        # ZONE_TOLERANCE_PCT for the exact definition of a "visit".
+        text += (
+            f"\n📍 This price zone (~{result['last_close']:.6g} ±{ZONE_TOLERANCE_PCT:.0f}%) "
+            f"was tested {result['zone_visits']} times in the available history before this breakout."
         )
     targets = result.get("targets") or []
     if result["signal"] == "breakout" and targets:
@@ -2314,6 +2651,12 @@ def run_cycle(products, state, outcomes):
             # never swallowed, while a same-reason re-check (the common
             # case, most cycles) still stays silent as before.
             if new_signal == "watching" and (new_signal != prev_signal or new_reason != prev_reason):
+                # Extra 6H-timeframe context, fetched ONLY here -- i.e. only
+                # for the specific product that's actually about to alert,
+                # not for all ~400 products every cycle. See
+                # fetch_6h_context() for the full rationale.
+                result["ctx_6h"] = fetch_6h_context(product_id)
+                time.sleep(REQUEST_PACING_SECONDS)
                 notify(product_id, result)
 
             state[product_id] = {
@@ -2382,6 +2725,11 @@ def run_daily_cycle(products, daily_state, outcomes):
 
             # edge-triggered: only alert on a fresh transition INTO breakout
             if new_signal == "breakout" and new_signal != prev_signal:
+                # Extra 6H-timeframe context, fetched ONLY here -- see the
+                # matching comment in run_cycle() above and
+                # fetch_6h_context()'s docstring for the full rationale.
+                result["ctx_6h"] = fetch_6h_context(product_id)
+                time.sleep(REQUEST_PACING_SECONDS)
                 notify(product_id, result)
                 record_pending_outcome(outcomes, product_id, result, datetime.now(timezone.utc))
                 save_json_file(OUTCOMES_FILE, outcomes)
