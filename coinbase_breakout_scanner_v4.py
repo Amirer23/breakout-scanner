@@ -202,6 +202,25 @@ CYCLE_SLEEP_SECONDS = 300           # 5 minutes between full scan cycles
 REQUEST_PACING_SECONDS = 0.35       # ~3 requests/sec, safely under Coinbase's public rate limit
 MAX_RETRIES = 3
 
+# How often (hours) the bot proactively sends a Telegram "heartbeat" with a
+# health snapshot -- added 2026-08-21 so silence itself becomes the signal
+# something's wrong, instead of relying on Amir noticing the absence of
+# alerts (a weak signal, easy to miss, especially since most cycles produce
+# no alert at all even when everything's healthy). See send_heartbeat() /
+# handle_status_command() (the on-demand /status version of the same thing).
+HEARTBEAT_INTERVAL_HOURS = float(os.environ.get("HEARTBEAT_INTERVAL_HOURS", "6"))
+
+# Populated by main()'s loop; read by handle_status_command() and
+# send_heartbeat(). Module-level (not threaded through the Telegram command
+# dispatch, which is zero-arg like every other handler in this file) so the
+# Telegram polling thread can read live health data without main() having to
+# pass anything to it.
+_health = {
+    "process_start": None, "cycle_count": 0, "last_cycle_seconds": None,
+    "last_pairs_scanned": None, "errors_since_start": 0,
+    "last_error": None, "last_error_time": None,
+}
+
 # Persistent state directory. Render's default filesystem is EPHEMERAL --
 # every file written to the plain working directory is wiped on each
 # deploy. Confirmed live on 2026-08-18: trades.json (and therefore
@@ -234,6 +253,15 @@ DAILY_CHECK_MARKER_FILE = _data_path("daily_check_marker.json")
 ALERTS_LOG_FILE = _data_path("alerts_log.jsonl")
 OPEN_ORDERS_STATE_FILE = _data_path("open_orders_state.json")  # which limit order IDs were open last cycle, to detect fills
 TRADES_FILE = _data_path("trades.json")         # ledger of every /buy /sell placed via the bot + limit-order resolutions (requested 2026-08-18, position tracking)
+EXIT_LEVELS_FILE = _data_path("exit_levels.json")  # structural stop/target watched per open bot position (added 2026-08-21, see compute_exit_levels())
+
+# ALERT-ONLY exit monitoring (added 2026-08-21, per Amir's explicit choice:
+# the bot never sells on its own -- it only tells him when a tracked
+# position's structural stop or target is crossed, exactly like it already
+# does for entries, and he decides what to do). Structural, not a fixed %:
+# stop = the daily resistance level the breakout broke above (thesis is
+# invalidated if price falls back below it); target = the same
+# find_price_targets() level already computed and shown at entry time.
 
 # --- Outcome tracking (win-rate stats for breakout signals) -----------------
 OUTCOMES_FILE = _data_path("outcomes.json")           # pending + resolved trade outcomes
@@ -1625,6 +1653,7 @@ def execute_buy(product_id, usd_amount):
                 "amount_usd": usd_amount, "base_size": filled_size, "price": avg_price,
                 "fee_usd": fee, "order_id": order_id,
             })
+            _maybe_init_exit_levels(product_id)
         else:
             telegram_send(f"❌ BUY failed: {product_id} for ${usd_amount}\n{resp.get('error_response', resp)}")
     except Exception as e:
@@ -1663,6 +1692,7 @@ def execute_sell(product_id, usd_amount):
                 "amount_usd": usd_amount, "base_size": filled_size or base_size_str, "price": avg_price,
                 "fee_usd": fee, "order_id": order_id,
             })
+            _notify_if_position_closed(product_id)
         else:
             telegram_send(f"❌ SELL failed: {product_id} for ${usd_amount}\n{resp.get('error_response', resp)}")
     except Exception as e:
@@ -1811,6 +1841,7 @@ def execute_buy_all(product_id, limit_price=None):
                 "amount_usd": available, "base_size": filled_size, "price": avg_price,
                 "fee_usd": fee, "order_id": order_id,
             })
+            _maybe_init_exit_levels(product_id)
         else:
             telegram_send(f"❌ BUY ALL failed: {product_id}\n{resp.get('error_response', resp)}")
     except Exception as e:
@@ -1942,6 +1973,7 @@ def execute_sell_all(product_id, limit_price=None):
                 "amount_usd": usd_value, "base_size": filled_size or base_size_str, "price": avg_price,
                 "fee_usd": fee, "order_id": order_id,
             })
+            _notify_if_position_closed(product_id)
         else:
             telegram_send(f"❌ SELL ALL failed: {product_id}\n{resp.get('error_response', resp)}")
     except Exception as e:
@@ -2160,6 +2192,10 @@ def check_order_fills(known_open_ids):
             "side": side, "kind": "limit", "status": status.lower(),
             "base_size": filled_size, "price": avg_price, "fee_usd": fee, "order_id": order_id,
         })
+        if side == "SELL" and status == "FILLED":
+            _notify_if_position_closed(product_id)
+        elif side == "BUY" and status == "FILLED":
+            _maybe_init_exit_levels(product_id)
 
     return current_open_ids
 
@@ -2250,17 +2286,55 @@ def handle_balance_command():
 
 
 def _compute_avg_entry_prices():
-    """Build a simple average-cost-basis ledger per product_id by replaying
-    trades.json in order: tracks running quantity and running cost basis
-    per symbol using the AVERAGE COST method (not FIFO) -- on a partial
-    sell, the average entry price is unchanged, only quantity and total
-    cost basis shrink proportionally. Only counts entries with status
-    "executed" (market fills) or "filled" (resolved limit orders) that
-    have a known numeric base_size and price -- a limit order still sitting
-    at status "placed" isn't an actual transaction yet, so it's skipped.
-    Returns {product_id: avg_entry_price}."""
+    """Thin wrapper over _compute_position_ledger() kept for backward
+    compatibility -- returns {product_id: avg_entry_price} for currently
+    open (bot-tracked) positions only. See _compute_position_ledger() for
+    the full picture (fee-adjusted, plus realized P&L)."""
+    open_positions, _realized = _compute_position_ledger()
+    return {pid: pos["avg_price"] for pid, pos in open_positions.items()}
+
+
+def _compute_position_ledger():
+    """Replay trades.json in order (AVERAGE COST method, fee-adjusted) to
+    build two things at once:
+
+    1. open_positions: {product_id: {"qty": float, "avg_price": float}}
+       for every symbol the bot currently has an open (qty > ~0) tracked
+       position in. avg_price folds BUY-side fees into the cost basis (so
+       it's the true all-in cost per unit, not just the raw fill price) --
+       added 2026-08-21 per Amir's own measured ~0.02%/trade fee data;
+       previously fees were recorded in trades.json but never actually
+       used in any P&L math.
+
+    2. realized: {product_id: {
+           "realized_pnl_usd": float,       -- cumulative, fee-adjusted,
+                                                across every SELL ever
+                                                executed via the bot for
+                                                this product
+           "total_fees_usd": float,         -- cumulative fees on those sells
+           "closed_lots": int,              -- how many times this symbol
+                                                has gone from open -> fully
+                                                flat via the bot
+           "last_close": {"avg_entry":, "avg_exit":, "pnl_usd":} or None
+                                             -- snapshot of the MOST RECENT
+                                                full close (for the
+                                                position-closed Telegram
+                                                notice); None if the
+                                                symbol has never fully
+                                                closed via the bot
+       }}
+       Only ever reflects trades placed through this bot (see /positions'
+       docstring for why a manually-bought-outside-the-bot chunk of the
+       same coin isn't and can't be reflected here).
+
+    Only counts entries with status "executed" (market fills) or "filled"
+    (resolved limit orders) that have a known numeric base_size and price
+    -- a limit order still sitting at status "placed" isn't an actual
+    transaction yet, so it's skipped (and correctly so: it hasn't moved
+    any real quantity)."""
     trades = load_json_file(TRADES_FILE, [])
-    ledger = {}  # product_id -> {"qty": float, "cost": float}
+    ledger = {}     # product_id -> {"qty": float, "cost": float}
+    realized = {}   # product_id -> accumulator dict, see docstring
     for t in trades:
         if t.get("status") not in ("executed", "filled"):
             continue
@@ -2273,34 +2347,291 @@ def _compute_avg_entry_prices():
             continue
         if size <= 0 or price <= 0:
             continue
+        try:
+            fee = float(t.get("fee_usd") or 0)
+        except (TypeError, ValueError):
+            fee = 0.0
         pos = ledger.setdefault(product_id, {"qty": 0.0, "cost": 0.0})
         if side == "BUY":
             pos["qty"] += size
-            pos["cost"] += size * price
+            pos["cost"] += size * price + fee  # fold buy-side fee into cost basis
         elif side == "SELL" and pos["qty"] > 0:
             sell_qty = min(size, pos["qty"])
-            pos["cost"] *= (pos["qty"] - sell_qty) / pos["qty"]
+            avg_cost_per_unit = pos["cost"] / pos["qty"]
+            cost_of_sold = sell_qty * avg_cost_per_unit
+            proceeds = sell_qty * price - fee  # sell-side fee reduces proceeds directly
+            pnl = proceeds - cost_of_sold
+
+            r = realized.setdefault(product_id, {
+                "realized_pnl_usd": 0.0, "total_fees_usd": 0.0, "closed_lots": 0,
+                "last_close": None,
+                "_pnl_at_prev_close": 0.0, "_sold_qty_since_close": 0.0,
+                "_sold_proceeds_since_close": 0.0, "_last_avg_entry": None,
+            })
+            r["realized_pnl_usd"] += pnl
+            r["total_fees_usd"] += fee
+            r["_last_avg_entry"] = avg_cost_per_unit
+            r["_sold_qty_since_close"] += sell_qty
+            r["_sold_proceeds_since_close"] += sell_qty * price
+
+            pos["cost"] -= cost_of_sold
             pos["qty"] -= sell_qty
-    return {
-        product_id: (pos["cost"] / pos["qty"])
-        for product_id, pos in ledger.items()
-        if pos["qty"] > 1e-12
+            if pos["qty"] <= 1e-9:
+                r["closed_lots"] += 1
+                r["last_close"] = {
+                    "avg_entry": r["_last_avg_entry"],
+                    "avg_exit": r["_sold_proceeds_since_close"] / r["_sold_qty_since_close"],
+                    "pnl_usd": r["realized_pnl_usd"] - r["_pnl_at_prev_close"],
+                }
+                r["_pnl_at_prev_close"] = r["realized_pnl_usd"]
+                r["_sold_qty_since_close"] = 0.0
+                r["_sold_proceeds_since_close"] = 0.0
+
+    open_positions = {
+        pid: {"qty": p["qty"], "avg_price": p["cost"] / p["qty"]}
+        for pid, p in ledger.items() if p["qty"] > 1e-9
     }
+    # Strip the internal bookkeeping keys (prefixed "_") before returning --
+    # they're implementation detail, not part of the public shape.
+    realized_clean = {
+        pid: {k: v for k, v in r.items() if not k.startswith("_")}
+        for pid, r in realized.items()
+    }
+    return open_positions, realized_clean
+
+
+def _notify_if_position_closed(product_id):
+    """Call this right after recording an executed/filled SELL. If that
+    sell brought the bot-tracked position for product_id fully back to
+    flat, sends a one-time Telegram notice with the realized P&L for that
+    closed round-trip (fee-adjusted, via _compute_position_ledger()).
+    Silent no-op if the position is still open. Never raises -- this is a
+    nice-to-have notification, not allowed to block or break the actual
+    sell flow it's called from."""
+    try:
+        open_positions, realized = _compute_position_ledger()
+        if product_id in open_positions:
+            return  # still open (partial sell) -- nothing to announce yet
+        r = realized.get(product_id)
+        close = r.get("last_close") if r else None
+        if not close:
+            return
+        entry = close["avg_entry"]
+        exitp = close["avg_exit"]
+        pnl = close["pnl_usd"]
+        pnl_pct = ((exitp - entry) / entry) * 100 if entry else 0.0
+        icon = "🟢" if pnl >= 0 else "🔴"
+        telegram_send(
+            f"{icon} Position closed: {product_id}\n"
+            f"Avg entry: {entry:.6g}   Avg exit: {exitp:.6g}\n"
+            f"Realized P&L (after fees): {pnl:+,.2f}$ ({pnl_pct:+.1f}%)"
+        )
+    except Exception as e:
+        print(f"  [warn] _notify_if_position_closed({product_id}) failed: {e}")
+    finally:
+        # Position is flat now (or the whole check above failed and we can't
+        # be sure) -- either way, stop watching stale exit levels for it. A
+        # future re-buy computes fresh ones via _maybe_init_exit_levels().
+        try:
+            _clear_exit_levels(product_id)
+        except Exception as e:
+            print(f"  [warn] _clear_exit_levels({product_id}) failed: {e}")
+
+
+def compute_exit_levels(product_id):
+    """Compute a STRUCTURAL stop and target for a newly-opened bot
+    position in product_id, reusing the exact same daily resistance /
+    find_price_targets() logic the breakout signal itself uses (see
+    analyze_daily()) rather than an arbitrary fixed percentage:
+      stop   = the current 20-day resistance level. If the daily close
+               falls back below the level a breakout broke above, the
+               thesis is invalidated -- that's the structural definition
+               of "wrong", not a fixed distance.
+      target = the first computed price target (find_price_targets()) --
+               the next real historical resistance above, or a
+               measured-move projection if none exists in the fetched
+               window. Same target a breakout alert itself would show.
+
+    This is used for ALERTING ONLY (see check_exit_levels()) -- it never
+    places an order. Returns None if there isn't enough daily history to
+    compute a resistance level (mirrors analyze_daily()'s own minimum),
+    or on any fetch failure -- never raises, so it can't block the BUY
+    flow it's called from."""
+    try:
+        daily_candles = fetch_candles(product_id, granularity=86400)
+        if not daily_candles:
+            return None
+        daily_candles = drop_incomplete_last_candle(daily_candles, granularity_seconds=86400)
+        if len(daily_candles) < DAILY_LOOKBACK_CANDLES + 2:
+            return None
+        highs = [c[2] for c in daily_candles]
+        last_close = daily_candles[-1][4]
+        prior_highs = highs[-DAILY_LOOKBACK_CANDLES - 1 : -1]
+        resistance = max(prior_highs)
+        target_levels, target_method, _near = find_price_targets(
+            daily_candles, resistance, last_close, lookback=DAILY_LOOKBACK_CANDLES)
+        target = target_levels[0] if target_levels else None
+        return {"stop": resistance, "target": target, "target_method": target_method}
+    except Exception as e:
+        print(f"  [warn] compute_exit_levels({product_id}) failed: {e}")
+        return None
+
+
+def _clear_exit_levels(product_id):
+    """Stop watching product_id for stop/target alerts (position closed,
+    or tracking is being reset for a fresh re-buy)."""
+    levels = load_json_file(EXIT_LEVELS_FILE, {})
+    if product_id in levels:
+        del levels[product_id]
+        save_json_file(EXIT_LEVELS_FILE, levels)
+
+
+def _maybe_init_exit_levels(product_id):
+    """Call this right after recording an executed/filled BUY. If this
+    BUY just opened a brand-new bot-tracked position (was flat before),
+    compute and persist structural exit levels for it (see
+    compute_exit_levels()) and send a one-time Telegram confirmation of
+    what's being watched. A no-op if the position was already open before
+    this BUY (an add-on buy into an existing position keeps the original
+    levels rather than resetting them on every top-up) or if exit levels
+    are already being tracked for it. Never raises."""
+    try:
+        levels = load_json_file(EXIT_LEVELS_FILE, {})
+        if product_id in levels:
+            return  # already tracking this position -- an add-on buy, not a fresh open
+        open_positions, _realized = _compute_position_ledger()
+        if product_id not in open_positions:
+            return  # shouldn't happen right after a recorded BUY, but defensive
+        exits = compute_exit_levels(product_id)
+        if exits is None:
+            print(f"  [info] no exit levels computed for {product_id} (insufficient daily history) -- /positions still works, just no stop/target alerts for this one")
+            return
+        levels[product_id] = {
+            "stop": exits["stop"], "target": exits["target"],
+            "target_method": exits["target_method"],
+            "alerted_stop": False, "alerted_target": False,
+            "created": datetime.now(timezone.utc).isoformat(),
+        }
+        save_json_file(EXIT_LEVELS_FILE, levels)
+        entry_price = open_positions[product_id]["avg_price"]
+        lines = [
+            f"🎯 Watching exit levels for {product_id}",
+            f"Entry: {entry_price:.6g}",
+            f"Stop (structural, close back below = thesis invalidated): {exits['stop']:.6g}",
+        ]
+        if exits["target"] is not None:
+            lines.append(f"Target: {exits['target']:.6g}")
+        lines.append("(alert-only -- I'll ping you if either is crossed, you decide what to do)")
+        telegram_send("\n".join(lines))
+    except Exception as e:
+        print(f"  [warn] _maybe_init_exit_levels({product_id}) failed: {e}")
+
+
+def check_exit_levels():
+    """Called once per main scan cycle: for every bot position currently
+    being watched (exit_levels.json), checks the live price against its
+    stored structural stop/target and fires a ONE-TIME Telegram alert the
+    first time either is crossed (alerted_stop/alerted_target flags
+    prevent repeat spam every cycle after that). Alert-only, exactly like
+    every other signal in this bot -- never places an order on its own.
+
+    Also self-heals: if a product_id is still listed here but the bot's
+    own ledger no longer shows it as an open position (e.g. it was closed
+    through a path that didn't go through _notify_if_position_closed, or
+    the exit-levels file and trades.json ever drift out of sync), it's
+    dropped from tracking rather than alerting forever on a position that
+    doesn't exist anymore."""
+    levels = load_json_file(EXIT_LEVELS_FILE, {})
+    if not levels:
+        return
+    open_positions, _realized = _compute_position_ledger()
+    changed = False
+    for product_id, lv in list(levels.items()):
+        if product_id not in open_positions:
+            del levels[product_id]
+            changed = True
+            continue
+        price = get_current_price(product_id)
+        if price is None:
+            continue
+        if not lv.get("alerted_stop") and lv.get("stop") is not None and price <= lv["stop"]:
+            telegram_send(
+                f"🛑 STOP LEVEL HIT: {product_id}\n"
+                f"Price: {price:.6g}  Stop: {lv['stop']:.6g}\n"
+                f"Structural thesis invalidated (closed back below the broken resistance). Your call -- alert-only, nothing sold automatically."
+            )
+            lv["alerted_stop"] = True
+            changed = True
+        if not lv.get("alerted_target") and lv.get("target") is not None and price >= lv["target"]:
+            telegram_send(
+                f"🎯 TARGET HIT: {product_id}\n"
+                f"Price: {price:.6g}  Target: {lv['target']:.6g}\n"
+                f"Alert-only -- nothing sold automatically, your call whether to take it."
+            )
+            lv["alerted_target"] = True
+            changed = True
+    if changed:
+        save_json_file(EXIT_LEVELS_FILE, levels)
+
+
+def send_heartbeat():
+    """Send a Telegram health snapshot -- called periodically from main()'s
+    loop (every HEARTBEAT_INTERVAL_HOURS) and on-demand via /status
+    (handle_status_command(), a thin wrapper around this). The point isn't
+    any single heartbeat message -- it's that they arrive on a predictable
+    cadence, so a GAP in that cadence (no heartbeat, and no alerts either)
+    is itself the alarm that something's wrong, without Amir having to
+    notice the absence of alerts on his own or go check Render manually."""
+    if _health["process_start"] is None:
+        telegram_send("Bot is starting up -- health data not available yet.")
+        return
+    uptime = datetime.now(timezone.utc) - _health["process_start"]
+    hours = uptime.total_seconds() / 3600
+    lines = [
+        "💓 Heartbeat -- bot is alive",
+        f"Uptime: {hours:.1f}h",
+        f"Cycles completed: {_health['cycle_count']}",
+    ]
+    if _health["last_cycle_seconds"] is not None:
+        lines.append(f"Last cycle: {_health['last_cycle_seconds']:.1f}s, {_health['last_pairs_scanned']} pairs scanned")
+    lines.append(f"Errors since start: {_health['errors_since_start']}")
+    if _health["last_error"]:
+        lines.append(f"Last error ({_health['last_error_time']}): {_health['last_error']}")
+    lines.append(f"Trading: {'ENABLED' if TRADING_ENABLED else 'DISABLED'}")
+    telegram_send("\n".join(lines))
+
+
+def handle_status_command():
+    """Handle the /status Telegram command -- the on-demand version of the
+    periodic heartbeat (see send_heartbeat()'s docstring), for checking
+    health right now instead of waiting for the next scheduled one."""
+    send_heartbeat()
 
 
 def handle_positions_command():
     """Handle the /positions Telegram command -- cross-references the bot's
-    own trade ledger (trades.json, average-cost basis) against the REAL
-    current Coinbase balances (get_balances(), always the source of truth
-    for what you actually hold) to show an entry price and unrealized P&L
-    for each open position.
+    own trade ledger (trades.json, fee-adjusted average-cost basis via
+    _compute_position_ledger()) against the REAL current Coinbase balances
+    (get_balances(), always the source of truth for what you actually
+    hold) to show an entry price and unrealized P&L for each open
+    position.
 
     Important limitation: the average entry price is only known for
     quantity actually bought THROUGH this bot's /buy command. Anything
     bought outside the bot (directly in the Coinbase app, or before this
     feature existed) has no trade-log entry, so its entry price is
     genuinely unknown -- those rows say so explicitly rather than showing
-    a wrong or misleading number."""
+    a wrong or misleading number.
+
+    Hardened 2026-08-21: if you hold MORE of a coin than the bot's ledger
+    thinks it bought (i.e. you also bought some manually, in addition to
+    the bot-tracked purchase), the entry price shown is still correct
+    PER UNIT for the bot-bought portion -- but it no longer silently
+    applies that price (and the resulting $ P&L) to your full real
+    balance, since that would overstate/understate the true $ P&L by
+    blending in coins whose real cost basis this bot has no way to know.
+    Instead it computes $ P&L only over the ledger-known quantity and
+    flags the untracked remainder explicitly."""
     if not TRADING_ENABLED:
         telegram_send("Trading is not enabled -- COINBASE_API_KEY / COINBASE_API_SECRET are not set on the server.")
         return
@@ -2316,25 +2647,60 @@ def handle_positions_command():
     if not positions:
         telegram_send("📈 No open positions.")
         return
-    avg_entries = _compute_avg_entry_prices()
+    open_ledger, _realized = _compute_position_ledger()
     lines = ["📈 Open positions:"]
     for currency, avail, hold in sorted(positions, key=lambda x: x[0]):
         total = avail + hold
         current_price = get_current_price(f"{currency}-USD") or get_current_price(f"{currency}-USDC")
-        entry_price = avg_entries.get(f"{currency}-USD") or avg_entries.get(f"{currency}-USDC")
+        ledger_pos = open_ledger.get(f"{currency}-USD") or open_ledger.get(f"{currency}-USDC")
+        entry_price = ledger_pos["avg_price"] if ledger_pos else None
+        ledger_qty = ledger_pos["qty"] if ledger_pos else 0.0
         line = f"\n{currency}: {total:.8g}"
         if current_price:
             line += f"  (~${total * current_price:,.2f})"
         if entry_price and current_price:
             pnl_pct = ((current_price - entry_price) / entry_price) * 100
-            pnl_usd = (current_price - entry_price) * total
+            pnl_usd = (current_price - entry_price) * ledger_qty  # only the ledger-known qty, see docstring
             icon = "🟢" if pnl_pct >= 0 else "🔴"
             line += f"\n  entry (via bot): {entry_price:.6g}  now: {current_price:.6g}  {icon} {pnl_pct:+.1f}% ({pnl_usd:+,.2f}$)"
+            untracked = total - ledger_qty
+            if untracked > ledger_qty * 0.01 + 1e-9:  # meaningfully more held than the bot ever bought
+                line += f"\n  ⚠️ {untracked:.8g} {currency} held beyond what the bot bought -- entry/P&L above covers only the bot-tracked {ledger_qty:.8g}"
         elif entry_price:
             line += f"\n  entry (via bot): {entry_price:.6g}  (current price unavailable)"
         else:
             line += "\n  entry price unknown (not bought through the bot, or predates trade tracking)"
         lines.append(line)
+    telegram_send("\n".join(lines))
+
+
+def handle_pnl_command():
+    """Handle the /pnl Telegram command -- realized P&L (fee-adjusted)
+    across every position the bot has ever fully closed, plus a grand
+    total. Complements /positions (which only shows CURRENT unrealized
+    P&L on OPEN positions): this is the "how have I actually done"
+    number, covering trades that are already finished. Scope is the same
+    as /positions -- bot-tracked trades only (see _compute_position_ledger()'s
+    docstring)."""
+    _open, realized = _compute_position_ledger()
+    closed = {pid: r for pid, r in realized.items() if r["closed_lots"] > 0}
+    if not closed:
+        telegram_send("📊 No fully-closed bot-tracked positions yet.")
+        return
+    lines = ["📊 Realized P&L (bot-tracked trades, after fees):"]
+    total_pnl = 0.0
+    total_fees = 0.0
+    for product_id, r in sorted(closed.items()):
+        icon = "🟢" if r["realized_pnl_usd"] >= 0 else "🔴"
+        lines.append(
+            f"\n{product_id}: {icon} {r['realized_pnl_usd']:+,.2f}$ "
+            f"({r['closed_lots']} closed round-trip{'s' if r['closed_lots'] != 1 else ''}, "
+            f"{r['total_fees_usd']:.2f}$ fees)"
+        )
+        total_pnl += r["realized_pnl_usd"]
+        total_fees += r["total_fees_usd"]
+    icon = "🟢" if total_pnl >= 0 else "🔴"
+    lines.append(f"\n{icon} Total realized P&L: {total_pnl:+,.2f}$  (total fees: {total_fees:.2f}$)")
     telegram_send("\n".join(lines))
 
 
@@ -2528,6 +2894,8 @@ def parse_and_handle_command(text):
         handle_cancel_command(parts[1])
     elif cmd == "/positions":
         handle_positions_command()
+    elif cmd == "/pnl":
+        handle_pnl_command()
     elif cmd == "/history":
         n = 10
         if len(parts) == 2:
@@ -2546,6 +2914,8 @@ def parse_and_handle_command(text):
         handle_history_command(n)
     elif cmd == "/stats":
         handle_stats_command()
+    elif cmd == "/status":
+        handle_status_command()
     elif cmd == "/help":
         telegram_send(
             "Commands:\n"
@@ -2562,8 +2932,11 @@ def parse_and_handle_command(text):
             "/cancel ORDER_ID -- cancel an open limit order (ORDER_ID from /orders)\n"
             "/balance -- show free cash and open positions (real Coinbase balances)\n"
             "/positions -- open positions with entry price (via bot) and unrealized P&L\n"
+            "/pnl -- realized P&L (after fees) across every position the bot has fully closed\n"
             "/history [N] -- last N trades placed via the bot (default 10, no upper limit)\n"
             "/stats -- win/loss track record of breakout ALERTS (not trades)\n"
+            "/status -- bot health snapshot on demand (uptime, last cycle, errors) -- also sent automatically every "
+            f"{HEARTBEAT_INTERVAL_HOURS:g}h as a heartbeat\n"
             "Examples:\n"
             "  /buy BTC-USD 50\n"
             "  /buy BTC-USD 50, 60000\n"
@@ -2818,6 +3191,10 @@ def main():
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         threading.Thread(target=telegram_polling_loop, daemon=True).start()
 
+    _health["process_start"] = datetime.now(timezone.utc)
+    print(f"Heartbeat: every {HEARTBEAT_INTERVAL_HOURS:g}h (see /status for an on-demand check)")
+    last_heartbeat_sent = None
+
     while True:
         cycle_start = time.time()
         try:
@@ -2826,6 +3203,7 @@ def main():
 
             products = fetch_products()
             print(f"Scanning {len(products)} pairs on Coinbase ({'/'.join(sorted(QUOTE_CURRENCIES))})...")
+            _health["last_pairs_scanned"] = len(products)
 
             if products:
                 state, outcomes = run_cycle(products, state, outcomes)
@@ -2845,7 +3223,12 @@ def main():
 
             known_open_order_ids = check_order_fills(known_open_order_ids)
             save_json_file(OPEN_ORDERS_STATE_FILE, list(known_open_order_ids))
-        except Exception:
+
+            if TRADING_ENABLED:
+                check_exit_levels()
+
+            _health["cycle_count"] += 1
+        except Exception as e:
             # Per-product errors are already caught inside run_cycle, but
             # anything outside that (fetch_products, evaluate_pending_outcomes,
             # disk I/O, etc.) used to be unhandled -- one bad response or a
@@ -2854,10 +3237,23 @@ def main():
             # single bad cycle can't take the whole scanner down.
             print("  [error] unexpected failure in main cycle -- scanner will keep running")
             traceback.print_exc()
+            _health["errors_since_start"] += 1
+            _health["last_error"] = str(e)
+            _health["last_error_time"] = datetime.now(timezone.utc).isoformat()
 
         elapsed = time.time() - cycle_start
+        _health["last_cycle_seconds"] = elapsed
+        print(f"Cycle done in {elapsed:.1f}s. Sleeping {max(0, CYCLE_SLEEP_SECONDS - elapsed):.1f}s.")
+
+        now_utc = datetime.now(timezone.utc)
+        if last_heartbeat_sent is None or (now_utc - last_heartbeat_sent).total_seconds() >= HEARTBEAT_INTERVAL_HOURS * 3600:
+            try:
+                send_heartbeat()
+            except Exception as e:
+                print(f"  [warn] send_heartbeat failed: {e}")
+            last_heartbeat_sent = now_utc
+
         sleep_for = max(0, CYCLE_SLEEP_SECONDS - elapsed)
-        print(f"Cycle done in {elapsed:.1f}s. Sleeping {sleep_for:.1f}s.")
         time.sleep(sleep_for)
 
 
