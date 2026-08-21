@@ -1099,6 +1099,42 @@ def fetch_6h_context(product_id):
         return None
 
 
+def get_btc_trend():
+    """BTC-USD daily-trend snapshot (added 2026-08-21, item #6 from Amir's
+    "what's missing" list -- market-regime awareness, INFORMATIONAL ONLY:
+    tags alerts with the broader market backdrop, never suppresses or
+    blocks an alert. Amir explicitly declined a suppression/filtering
+    version of this ("just tag it, don't hide anything").
+
+    Same treatment as fetch_6h_context() above: fetched ONLY right before
+    notify() actually fires for some OTHER pair (see the two call sites in
+    run_cycle/run_daily_cycle), not once per pair per cycle -- BTC itself
+    rarely alerts, so in practice this runs a handful of times a day, not
+    ~400 times per cycle. Reuses the exact same EMA9/EMA26 classification
+    used everywhere else in this file (see analyze()/fetch_6h_context())
+    for consistency -- same trend definition everywhere, just applied to
+    BTC-USD's own daily candles instead of the alerting pair's.
+
+    Returns "bullish"/"bearish"/"flat", or None if the fetch fails or
+    there's insufficient BTC daily history to compute the EMAs -- notify()
+    treats None as "omit this line", so a transient hiccup on this
+    SECONDARY fetch never blocks the underlying alert."""
+    try:
+        candles = fetch_candles("BTC-USD", granularity=86400)
+        if not candles:
+            return None
+        candles = drop_incomplete_last_candle(candles, granularity_seconds=86400)
+        closes = [c[4] for c in candles]
+        ema_fast = ema(closes, EMA_FAST_PERIOD)
+        ema_slow = ema(closes, EMA_SLOW_PERIOD)
+        if ema_fast is None or ema_slow is None:
+            return None
+        return "bullish" if ema_fast > ema_slow else ("bearish" if ema_fast < ema_slow else "flat")
+    except Exception as e:
+        print(f"  [warn] get_btc_trend() failed: {e}")
+        return None
+
+
 # ----------------------------------------------------------------------------
 # State (avoid duplicate alerts) + notification hook
 # ----------------------------------------------------------------------------
@@ -1296,6 +1332,18 @@ def notify(product_id, result):
             parts.append(f"trend {trend_icon} {ctx_6h['ema_trend']}")
         if parts:
             text += f"\n6H context: {' · '.join(parts)}"
+    if result.get("btc_trend") is not None:
+        # Market-regime context (added 2026-08-21, item #6) -- see
+        # get_btc_trend()'s docstring. Informational only: shown for every
+        # alert on every pair (bullish/bearish/flat all shown, not just
+        # bad news), with an extra ⚠️ + caution note only when BTC itself
+        # is trending down, since that's the case where "this pair looks
+        # like a breakout" is most likely to be a coin getting dragged
+        # along with a falling BTC rather than a genuine independent move.
+        trend_icon = {"bullish": "📈", "bearish": "📉", "flat": "➡️"}.get(result["btc_trend"], "")
+        text += f"\nBTC trend (daily): {trend_icon} {result['btc_trend']}"
+        if result["btc_trend"] == "bearish":
+            text += " ⚠️ market headwind -- treat this breakout with extra caution"
     if result.get("watching_reason") == "cleared_hourly":
         # Distinguishes the two ways a coin can end up "watching" (added
         # 2026-08-19, alongside the hourly/daily split -- see
@@ -3033,6 +3081,12 @@ def run_cycle(products, state, outcomes):
                 # fetch_6h_context() for the full rationale.
                 result["ctx_6h"] = fetch_6h_context(product_id)
                 time.sleep(REQUEST_PACING_SECONDS)
+                if product_id != "BTC-USD":
+                    # Skip the self-referential case: BTC-USD's own alert
+                    # already shows BTC-USD's own RSI/EMA9-26 trend above --
+                    # tagging it with "BTC trend" again would be redundant.
+                    result["btc_trend"] = get_btc_trend()
+                    time.sleep(REQUEST_PACING_SECONDS)
                 notify(product_id, result)
 
             state[product_id] = {
@@ -3106,6 +3160,9 @@ def run_daily_cycle(products, daily_state, outcomes):
                 # fetch_6h_context()'s docstring for the full rationale.
                 result["ctx_6h"] = fetch_6h_context(product_id)
                 time.sleep(REQUEST_PACING_SECONDS)
+                if product_id != "BTC-USD":
+                    result["btc_trend"] = get_btc_trend()
+                    time.sleep(REQUEST_PACING_SECONDS)
                 notify(product_id, result)
                 record_pending_outcome(outcomes, product_id, result, datetime.now(timezone.utc))
                 save_json_file(OUTCOMES_FILE, outcomes)
