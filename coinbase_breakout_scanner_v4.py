@@ -76,6 +76,9 @@ QUOTE_CURRENCIES = {"USD", "USDC"}  # scan BOTH: Amir's Coinbase app displays pa
 STABLECOIN_BASE_SYMBOLS = {
     "USDT", "USDC", "USDS", "DAI", "PYUSD", "GUSD", "TUSD", "USDP",
     "FDUSD", "USDD", "EURC", "EURT", "LUSD", "SUSD", "USTC", "USDE",
+    "USD1",  # World Liberty Financial's USD1 -- added 2026-08-21 after a false
+             # USD1-USD "WATCHING" alert (Price 0.9996 vs Resistance 0.9999,
+             # same peg-noise pattern as the original USDS-USD false alert above).
 }
 GRANULARITY_SECONDS = 3600          # candle size: 60, 300, 900, 3600, 21600, 86400
 LOOKBACK_CANDLES = 20               # how many candles define "resistance"
