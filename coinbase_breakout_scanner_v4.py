@@ -1580,6 +1580,17 @@ def _floor_to_precision(value, decimals=8):
     return math.floor(value * factor) / factor
 
 
+# Set by get_base_increment() on its most recent call -- None if the last
+# call succeeded, otherwise a short human-readable reason. Read by callers
+# that want to tell the user WHY a precision fallback happened (e.g.
+# execute_buy_all()'s limit path), instead of leaving them to guess.
+# Confirmed live 2026-08-24: FET-USDC's "/buy ... all" failed twice in a
+# row with INVALID_SIZE_PRECISION -- without this, there was no way to
+# tell whether that meant the increment lookup itself failed (this
+# fallback firing) or something else entirely was wrong.
+_LAST_BASE_INCREMENT_ERROR = None
+
+
 def get_base_increment(product_id):
     """Fetch this product's REAL base_increment -- the exact order-size
     step Coinbase enforces for THIS specific pair (e.g. "0.00000001" for
@@ -1590,16 +1601,32 @@ def get_base_increment(product_id):
     That's a different API surface that doesn't even know about every pair
     the trading API supports -- confirmed live 2026-08-18: SOL-USDC 404'd
     there while trading fine through _trade_client (see
-    execute_sell_all()'s comment on the same issue for candles). Returns
-    None on any failure so callers fall back to the old flat-8-decimal
-    behavior instead of blocking the trade outright on a lookup hiccup."""
-    try:
-        product = _to_dict(_trade_client.get_product(product_id))
-        increment = product.get("base_increment")
-        return str(increment) if increment else None
-    except Exception as e:
-        print(f"  [warn] get_base_increment({product_id}) failed, falling back to 8-decimal precision: {e}")
-        return None
+    execute_sell_all()'s comment on the same issue for candles).
+
+    Retries once (immediate, no backoff -- this only runs on a user-issued
+    buy/sell, not the hot scan loop, so one extra round-trip is cheap) before
+    giving up, on the theory that a single lookup failure is more likely a
+    transient hiccup than a permanently-missing pair. Still returns None on
+    failure so callers fall back to the old flat-8-decimal behavior instead
+    of blocking the trade outright -- but now also sets
+    _LAST_BASE_INCREMENT_ERROR so callers can surface the real reason
+    instead of a silent, unexplained fallback."""
+    global _LAST_BASE_INCREMENT_ERROR
+    last_exc = None
+    for attempt in range(2):
+        try:
+            product = _to_dict(_trade_client.get_product(product_id))
+            increment = product.get("base_increment")
+            if increment:
+                _LAST_BASE_INCREMENT_ERROR = None
+                return str(increment)
+            last_exc = f"get_product({product_id}) returned no base_increment field"
+            break  # a clean response with a missing field won't fix itself on retry
+        except Exception as e:
+            last_exc = str(e)
+    print(f"  [warn] get_base_increment({product_id}) failed after retry, falling back to 8-decimal precision: {last_exc}")
+    _LAST_BASE_INCREMENT_ERROR = last_exc
+    return None
 
 
 def _floor_to_increment_str(value, increment_str):
@@ -1837,6 +1864,16 @@ def execute_buy_all(product_id, limit_price=None):
         # lookups of the same, unchanging value). See _size_str_for_order()
         # for why 8 decimal places can't just be assumed for every pair.
         increment = get_base_increment(product_id)
+        # Only relevant if every attempt below ends in failure -- lets the
+        # final error message say WHY the fallback 8-decimal formatting was
+        # used, instead of leaving an INVALID_SIZE_PRECISION error
+        # unexplained. See _LAST_BASE_INCREMENT_ERROR's docstring.
+        precision_note = (
+            f"\n(note: couldn't fetch {product_id}'s real size precision from Coinbase "
+            f"({_LAST_BASE_INCREMENT_ERROR}) -- fell back to 8-decimal formatting, which is "
+            f"wrong for some pairs and can cause exactly this error. Retry the command; if it "
+            f"keeps failing the same way, this pair likely needs its precision handled manually.)"
+        ) if not increment else ""
         spend_fraction = 1.0
         last_error_text = None
         for attempt in range(8):
@@ -1885,7 +1922,7 @@ def execute_buy_all(product_id, limit_price=None):
                 last_error_text = error_text
                 spend_fraction -= 0.005
                 continue
-            telegram_send(f"❌ LIMIT BUY ALL failed: {product_id} ~{spend:,.2f} {quote_currency} @ {limit_price}\n{error_text}")
+            telegram_send(f"❌ LIMIT BUY ALL failed: {product_id} ~{spend:,.2f} {quote_currency} @ {limit_price}\n{error_text}{precision_note}")
             print(f"  [error] limit buy-all order failed: {error_text}")
             return
         telegram_send(
