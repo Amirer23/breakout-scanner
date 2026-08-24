@@ -1629,6 +1629,30 @@ def get_base_increment(product_id):
     return None
 
 
+def _precision_fallback_note(product_id):
+    """Explanatory note to append to an order-failure Telegram message when
+    the failure MIGHT be explained by a base_increment lookup miss (see
+    _LAST_BASE_INCREMENT_ERROR's docstring -- added 2026-08-24 after
+    FET-USDC's "/buy ... all" failed twice with INVALID_SIZE_PRECISION and
+    there was no way to tell whether that was caused by this fallback).
+
+    Callers must call this immediately after get_base_increment() or
+    _size_str_for_order() ran for THIS product_id -- it just reads whatever
+    that call left in the global _LAST_BASE_INCREMENT_ERROR, it doesn't
+    call get_base_increment() itself (that would be a second, redundant
+    lookup, and could even show a misleadingly different result on a flaky
+    connection). Returns "" if that lookup succeeded, since then the
+    8-decimal fallback wasn't in play and there's nothing to explain."""
+    if _LAST_BASE_INCREMENT_ERROR is None:
+        return ""
+    return (
+        f"\n(note: couldn't fetch {product_id}'s real size precision from Coinbase "
+        f"({_LAST_BASE_INCREMENT_ERROR}) -- fell back to 8-decimal formatting, which is "
+        f"wrong for some pairs and can cause exactly this error. Retry the command; if it "
+        f"keeps failing the same way, this pair likely needs its precision handled manually.)"
+    )
+
+
 def _floor_to_increment_str(value, increment_str):
     """Floor `value` DOWN to the nearest multiple of increment_str (a
     decimal string like "0.01" or "1", as returned by Coinbase's
@@ -1773,6 +1797,9 @@ def execute_sell(product_id, usd_amount):
     # base_increment, not a blanket 8 decimals (which fails with
     # INVALID_SIZE_PRECISION on coarser-precision pairs).
     base_size_str = _size_str_for_order(usd_amount / price, product_id)
+    # See _precision_fallback_note()'s docstring -- must be read right after
+    # the _size_str_for_order() call above.
+    precision_note = _precision_fallback_note(product_id)
     try:
         resp = _to_dict(_trade_client.market_order_sell(
             client_order_id=order_id, product_id=product_id, base_size=base_size_str))
@@ -1791,10 +1818,10 @@ def execute_sell(product_id, usd_amount):
             })
             _notify_if_position_closed(product_id)
         else:
-            telegram_send(f"❌ SELL failed: {product_id} for ${usd_amount}\n{resp.get('error_response', resp)}")
+            telegram_send(f"❌ SELL failed: {product_id} for ${usd_amount}\n{resp.get('error_response', resp)}{precision_note}")
     except Exception as e:
         detail = _coinbase_error_detail(e)
-        telegram_send(f"❌ SELL error: {product_id} for ${usd_amount}\n{e}{detail}")
+        telegram_send(f"❌ SELL error: {product_id} for ${usd_amount}\n{e}{detail}{precision_note}")
         print(f"  [error] sell order failed: {e}{detail}")
         traceback.print_exc()
 
@@ -1867,13 +1894,9 @@ def execute_buy_all(product_id, limit_price=None):
         # Only relevant if every attempt below ends in failure -- lets the
         # final error message say WHY the fallback 8-decimal formatting was
         # used, instead of leaving an INVALID_SIZE_PRECISION error
-        # unexplained. See _LAST_BASE_INCREMENT_ERROR's docstring.
-        precision_note = (
-            f"\n(note: couldn't fetch {product_id}'s real size precision from Coinbase "
-            f"({_LAST_BASE_INCREMENT_ERROR}) -- fell back to 8-decimal formatting, which is "
-            f"wrong for some pairs and can cause exactly this error. Retry the command; if it "
-            f"keeps failing the same way, this pair likely needs its precision handled manually.)"
-        ) if not increment else ""
+        # unexplained. See _precision_fallback_note()/_LAST_BASE_INCREMENT_ERROR's
+        # docstrings.
+        precision_note = _precision_fallback_note(product_id)
         spend_fraction = 1.0
         last_error_text = None
         for attempt in range(8):
@@ -2027,6 +2050,10 @@ def execute_sell_all(product_id, limit_price=None):
     # Computed once and reused below for both the limit and market
     # branches, since `available` itself doesn't change between them.
     base_size_str = _size_str_for_order(available, product_id)
+    # See _precision_fallback_note()'s docstring -- must be read right after
+    # the _size_str_for_order() call above, before anything else touches
+    # get_base_increment() for a different product_id.
+    precision_note = _precision_fallback_note(product_id)
 
     if limit_price:
         # Limit sell: the whole available base_size at limit_price, exactly
@@ -2057,10 +2084,10 @@ def execute_sell_all(product_id, limit_price=None):
                 })
                 _pending_new_order_ids.add(order_id)
             else:
-                telegram_send(f"❌ LIMIT SELL ALL failed: {product_id} {available:.8g} {base_currency} @ {limit_price}\n{resp.get('error_response', resp)}")
+                telegram_send(f"❌ LIMIT SELL ALL failed: {product_id} {available:.8g} {base_currency} @ {limit_price}\n{resp.get('error_response', resp)}{precision_note}")
         except Exception as e:
             detail = _coinbase_error_detail(e)
-            telegram_send(f"❌ LIMIT SELL ALL error: {product_id} {available:.8g} {base_currency} @ {limit_price}\n{e}{detail}")
+            telegram_send(f"❌ LIMIT SELL ALL error: {product_id} {available:.8g} {base_currency} @ {limit_price}\n{e}{detail}{precision_note}")
             print(f"  [error] limit sell-all order failed: {e}{detail}")
             traceback.print_exc()
         return
@@ -2083,10 +2110,10 @@ def execute_sell_all(product_id, limit_price=None):
             })
             _notify_if_position_closed(product_id)
         else:
-            telegram_send(f"❌ SELL ALL failed: {product_id}\n{resp.get('error_response', resp)}")
+            telegram_send(f"❌ SELL ALL failed: {product_id}\n{resp.get('error_response', resp)}{precision_note}")
     except Exception as e:
         detail = _coinbase_error_detail(e)
-        telegram_send(f"❌ SELL ALL error: {product_id}\n{e}{detail}")
+        telegram_send(f"❌ SELL ALL error: {product_id}\n{e}{detail}{precision_note}")
         print(f"  [error] sell-all order failed: {e}{detail}")
         traceback.print_exc()
 
@@ -2105,6 +2132,9 @@ def execute_buy_limit(product_id, usd_amount, limit_price):
     # order's true cost fractionally over budget; a flat 8 decimals fails
     # with INVALID_SIZE_PRECISION on pairs with a coarser real increment).
     base_size_str = _size_str_for_order(usd_amount / limit_price, product_id)
+    # See _precision_fallback_note()'s docstring -- must be read right after
+    # the _size_str_for_order() call above.
+    precision_note = _precision_fallback_note(product_id)
     try:
         resp = _to_dict(_trade_client.limit_order_gtc_buy(
             client_order_id=order_id, product_id=product_id,
@@ -2132,10 +2162,10 @@ def execute_buy_limit(product_id, usd_amount, limit_price):
             })
             _pending_new_order_ids.add(order_id)
         else:
-            telegram_send(f"❌ LIMIT BUY failed: {product_id} ~${usd_amount} @ {limit_price}\n{resp.get('error_response', resp)}")
+            telegram_send(f"❌ LIMIT BUY failed: {product_id} ~${usd_amount} @ {limit_price}\n{resp.get('error_response', resp)}{precision_note}")
     except Exception as e:
         detail = _coinbase_error_detail(e)
-        telegram_send(f"❌ LIMIT BUY error: {product_id} ~${usd_amount} @ {limit_price}\n{e}{detail}")
+        telegram_send(f"❌ LIMIT BUY error: {product_id} ~${usd_amount} @ {limit_price}\n{e}{detail}{precision_note}")
         print(f"  [error] limit buy order failed: {e}{detail}")
         traceback.print_exc()
 
@@ -2150,6 +2180,9 @@ def execute_sell_limit(product_id, usd_amount, limit_price):
     # docstring (same rounding-up hazard as the buy side, plus the
     # per-pair precision fix).
     base_size_str = _size_str_for_order(usd_amount / limit_price, product_id)
+    # See _precision_fallback_note()'s docstring -- must be read right after
+    # the _size_str_for_order() call above.
+    precision_note = _precision_fallback_note(product_id)
     try:
         resp = _to_dict(_trade_client.limit_order_gtc_sell(
             client_order_id=order_id, product_id=product_id,
@@ -2173,10 +2206,10 @@ def execute_sell_limit(product_id, usd_amount, limit_price):
             })
             _pending_new_order_ids.add(order_id)
         else:
-            telegram_send(f"❌ LIMIT SELL failed: {product_id} ~${usd_amount} @ {limit_price}\n{resp.get('error_response', resp)}")
+            telegram_send(f"❌ LIMIT SELL failed: {product_id} ~${usd_amount} @ {limit_price}\n{resp.get('error_response', resp)}{precision_note}")
     except Exception as e:
         detail = _coinbase_error_detail(e)
-        telegram_send(f"❌ LIMIT SELL error: {product_id} ~${usd_amount} @ {limit_price}\n{e}{detail}")
+        telegram_send(f"❌ LIMIT SELL error: {product_id} ~${usd_amount} @ {limit_price}\n{e}{detail}{precision_note}")
         print(f"  [error] limit sell order failed: {e}{detail}")
         traceback.print_exc()
 
