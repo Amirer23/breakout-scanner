@@ -1178,6 +1178,52 @@ def get_btc_trend():
         return None
 
 
+def fetch_daily_resistance(product_id):
+    """The actual DAILY-timeframe resistance level a "cleared_hourly"
+    watching alert is waiting on (added 2026-08-25, replacing notify()'s
+    vague "typically HIGHER, 20-day resistance level" note with a real
+    number -- requested after Amir watched SOL-USD clear its hourly
+    resistance hard, 4x volume, RSI 80+, and still only read "watching"
+    with no way to tell from the alert itself how far daily confirmation
+    actually was).
+
+    The original "cleared_hourly" note explained this number wasn't
+    fetched because doing so for every pair on every 5-minute cycle
+    wouldn't scale across ~400 pairs -- but exactly like
+    fetch_6h_context()/get_btc_trend() above, this is only ever called
+    ONCE, right before notify() fires for a coin that just cleared its
+    hourly resistance (see the call site in run_cycle()), not from the
+    hot per-pair loop -- so in practice this runs a handful of times a
+    day, not 400x per cycle. Same non-scaling concern, same answer as
+    those two: edge-triggered fetches on an alert that's already firing
+    are cheap; it's only "one extra fetch for all ~400 pairs every cycle"
+    that isn't.
+
+    Mirrors analyze_daily()'s own resistance calculation exactly (highest
+    daily high over the trailing DAILY_LOOKBACK_CANDLES days, excluding
+    the most recent/still-forming day) so the number shown here is
+    guaranteed to match what the real daily confirmation check will use
+    -- not a separate approximation of it that could drift out of sync.
+
+    Returns the resistance level (float), or None if the fetch fails or
+    there isn't yet enough daily history -- notify() falls back to the
+    original vague note in that case, same graceful-degradation pattern
+    as fetch_6h_context()/get_btc_trend()."""
+    try:
+        candles = fetch_candles(product_id, granularity=86400)
+        if not candles:
+            return None
+        candles = drop_incomplete_last_candle(candles, granularity_seconds=86400)
+        if len(candles) < DAILY_LOOKBACK_CANDLES + 2:
+            return None
+        highs = [c[2] for c in candles]
+        prior_highs = highs[-DAILY_LOOKBACK_CANDLES - 1 : -1]
+        return max(prior_highs)
+    except Exception as e:
+        print(f"  [warn] fetch_daily_resistance({product_id}) failed: {e}")
+        return None
+
+
 # ----------------------------------------------------------------------------
 # State (avoid duplicate alerts) + notification hook
 # ----------------------------------------------------------------------------
@@ -1406,16 +1452,30 @@ def notify(product_id, result):
         # review 2026-08-19: without this line, this alert reads as "clear
         # 1.7005 on today's close = BREAKOUT", which is false and would
         # reproduce the exact confusion this redesign was meant to fix.
-        # Not showing the actual daily number here -- computing it would
-        # require an extra daily-candle fetch for every "watching" coin on
-        # every 5-minute cycle, which doesn't scale across ~400 pairs.
-        text += (
-            "\n⏳ Cleared resistance on the hourly close -- watching for a "
-            "daily close confirmation before this becomes a BREAKOUT. Note: "
-            "daily confirmation is checked against a separately-computed, "
-            "typically HIGHER, 20-day resistance level -- not the hourly "
-            "level shown above."
-        )
+        # The actual daily number IS now fetched -- see fetch_daily_
+        # resistance()'s docstring for why this is cheap despite the
+        # concern in this comment's own history (edge-triggered, once per
+        # real alert, not once per pair per cycle). Falls back to the
+        # original vague note below if that fetch failed or came back None
+        # (e.g. a pair too new to have DAILY_LOOKBACK_CANDLES of daily
+        # history yet) -- same graceful-degradation pattern as ctx_6h/
+        # btc_trend above.
+        text += "\n⏳ Cleared resistance on the hourly close -- watching for a daily close confirmation before this becomes a BREAKOUT."
+        daily_resistance = result.get("daily_resistance")
+        if daily_resistance is not None:
+            dist = ((daily_resistance - result["last_close"]) / result["last_close"]) * 100
+            if dist > 0:
+                text += f" Daily confirmation level: {daily_resistance:.6g} ({dist:.1f}% above the current price)."
+            else:
+                text += (
+                    f" Daily confirmation level: {daily_resistance:.6g} -- already cleared intraday "
+                    f"({-dist:.1f}% below the current price), but still needs the FULL UTC day to close above it."
+                )
+        else:
+            text += (
+                " Note: daily confirmation is checked against a separately-computed, "
+                "typically HIGHER, 20-day resistance level -- not the hourly level shown above."
+            )
     if result.get("new_support") is not None:
         # Classic TA reading (added 2026-08-20, per Amir's own chart read
         # of SOL-USD): the resistance level that was JUST broken becomes
@@ -3387,6 +3447,12 @@ def run_cycle(products, state, outcomes):
                     # already shows BTC-USD's own RSI/EMA9-26 trend above --
                     # tagging it with "BTC trend" again would be redundant.
                     result["btc_trend"] = get_btc_trend()
+                    time.sleep(REQUEST_PACING_SECONDS)
+                if new_reason == "cleared_hourly":
+                    # Only for this reason -- "approaching" alerts don't show
+                    # the daily-confirmation note at all, so there's nothing
+                    # for this number to feed. See fetch_daily_resistance().
+                    result["daily_resistance"] = fetch_daily_resistance(product_id)
                     time.sleep(REQUEST_PACING_SECONDS)
                 notify(product_id, result)
 
