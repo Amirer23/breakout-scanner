@@ -221,6 +221,28 @@ _health = {
     "last_error": None, "last_error_time": None,
 }
 
+# /scan (added 2026-08-25, requested so a manual re-check doesn't mean
+# waiting up to 24h for the next automatic daily pass -- see
+# handle_scan_command() below). Same pattern as _health above: main()'s
+# loop creates daily_state/outcomes ONCE at startup and mutates those same
+# dict objects in place for the rest of the process's life (every
+# `x, y = run_daily_cycle(x, y)`-style reassignment in this file hands back
+# the identical object it was given) -- so stashing a reference here lets
+# handle_scan_command(), running on the separate Telegram polling thread,
+# operate on the SAME live state main()'s loop sees, not a stale copy.
+# Populated once by main() right after daily_state/outcomes are loaded.
+_shared_daily_state = None
+_shared_outcomes = None
+
+# Guards every run_daily_cycle() call -- scheduled (check_and_run_daily_pass)
+# or manual (/scan) -- so the two can never run concurrently. Without this,
+# a /scan firing right as the UTC day rolls over could interleave with the
+# automatic pass: both would read the same pre-scan daily_state, both could
+# see the same coin transition into "breakout" at once, and both would fire
+# notify() + record_pending_outcome() for it -- a duplicate Telegram alert
+# AND a duplicate win/loss stats entry for the same real-world signal.
+_daily_scan_lock = threading.Lock()
+
 # Persistent state directory. Render's default filesystem is EPHEMERAL --
 # every file written to the plain working directory is wiped on each
 # deploy. Confirmed live on 2026-08-18: trades.json (and therefore
@@ -3060,6 +3082,56 @@ def handle_stats_command():
     )
 
 
+def handle_scan_command():
+    """Handle the /scan Telegram command -- manually triggers a full
+    CONFIRMED-breakout pass (the same run_daily_cycle() that check_and_run_
+    daily_pass() otherwise only runs once per UTC day) across every pair,
+    right now, instead of waiting for the next automatic run. Requested
+    2026-08-25: "as usual, all of them" -- not scoped to one product_id,
+    same full universe fetch_products() returns to the automatic pass.
+
+    Deliberately does NOT touch DAILY_CHECK_MARKER_FILE -- that marker
+    controls only the AUTOMATIC once-per-UTC-day trigger in
+    check_and_run_daily_pass(). Running /scan doesn't consume or reset that
+    budget, so the automatic pass still fires normally at its own next UTC
+    rollover no matter how many times /scan is used in between. It reuses
+    (mutates in place) the SAME daily_state/outcomes dicts the automatic
+    pass uses -- see _shared_daily_state/_shared_outcomes above -- so a
+    coin /scan just confirmed as breakout won't alert again when the
+    automatic pass re-checks it later the same day (and vice versa).
+
+    Runs on its own background thread, not inline on the Telegram polling
+    thread that called this: a full ~400-pair pass takes several minutes
+    (REQUEST_PACING_SECONDS per pair, x2 for daily+6h-context candles on
+    anything that alerts), and polling is single-threaded -- every other
+    command (/status, /balance, ...) would sit unanswered until it
+    finished otherwise. Guarded by _daily_scan_lock so this can never run
+    concurrently with the automatic pass or a second /scan (see the lock's
+    own docstring for exactly what that race would otherwise cause)."""
+    if _shared_daily_state is None or _shared_outcomes is None:
+        telegram_send("Bot is still starting up -- try /scan again in a few seconds.")
+        return
+    if not _daily_scan_lock.acquire(blocking=False):
+        telegram_send("⏳ A scan is already running -- hang tight, it'll post results when it's done (usually a few minutes).")
+        return
+
+    def _run():
+        try:
+            products = fetch_products()
+            telegram_send(f"🔍 Manual scan starting: {len(products)} pairs. This can take a few minutes -- new confirmed breakouts will alert as they're found.")
+            run_daily_cycle(products, _shared_daily_state, _shared_outcomes)
+            save_json_file(DAILY_STATE_FILE, _shared_daily_state)
+            telegram_send(f"✅ Manual scan done: {len(products)} pairs checked.")
+        except Exception as e:
+            print(f"  [error] manual /scan failed: {e}")
+            traceback.print_exc()
+            telegram_send(f"❌ Manual scan failed partway through: {e}")
+        finally:
+            _daily_scan_lock.release()
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
 def parse_and_handle_command(text):
     """Parse one inbound Telegram message and dispatch it. Every /buy and
     /sell -- market or limit -- executes (or gets placed) directly once
@@ -3186,6 +3258,8 @@ def parse_and_handle_command(text):
         handle_stats_command()
     elif cmd == "/status":
         handle_status_command()
+    elif cmd == "/scan":
+        handle_scan_command()
     elif cmd == "/help":
         telegram_send(
             "Commands:\n"
@@ -3210,6 +3284,8 @@ def parse_and_handle_command(text):
             "/stats -- win/loss track record of breakout ALERTS (not trades)\n"
             "/status -- bot health snapshot on demand (uptime, last cycle, errors) -- also sent automatically every "
             f"{HEARTBEAT_INTERVAL_HOURS:g}h as a heartbeat\n"
+            "/scan -- manually run the full CONFIRMED-breakout pass on all pairs right now, instead of waiting for "
+            "the once-per-UTC-day automatic check (takes a few minutes; doesn't affect the automatic check's own schedule)\n"
             "Examples:\n"
             "  /buy BTC-USD 50\n"
             "  /buy BTC-USD 50, 60000\n"
@@ -3416,17 +3492,30 @@ def check_and_run_daily_pass(products, daily_state, outcomes):
 
     First-ever run (no marker file yet) always triggers immediately, so a
     fresh deploy gets a real daily baseline right away instead of waiting
-    up to 24h for the first confirmed-breakout check."""
+    up to 24h for the first confirmed-breakout check.
+
+    Guarded by _daily_scan_lock (added 2026-08-25, see its own docstring)
+    so this can never run at the same time as a manually-triggered /scan.
+    If a manual scan happens to be in progress exactly when the UTC day
+    rolls over, this simply skips for now -- it does NOT write
+    DAILY_CHECK_MARKER_FILE in that case, so it's retried next cycle (5 min
+    later) rather than the day silently going unchecked."""
     today_str = datetime.now(timezone.utc).date().isoformat()
     last_checked = load_json_file(DAILY_CHECK_MARKER_FILE, {}).get("date")
     if not products or today_str == last_checked:
         return daily_state, outcomes
 
-    print(f"\n=== New UTC day ({today_str}) -- running daily BREAKOUT check on {len(products)} pairs ===")
-    daily_state, outcomes = run_daily_cycle(products, daily_state, outcomes)
-    save_json_file(DAILY_STATE_FILE, daily_state)
-    save_json_file(DAILY_CHECK_MARKER_FILE, {"date": today_str})
-    print(f"=== Daily BREAKOUT check for {today_str} done ===")
+    if not _daily_scan_lock.acquire(blocking=False):
+        print(f"  [info] daily pass due for {today_str}, but a manual /scan is in progress -- will retry next cycle")
+        return daily_state, outcomes
+    try:
+        print(f"\n=== New UTC day ({today_str}) -- running daily BREAKOUT check on {len(products)} pairs ===")
+        daily_state, outcomes = run_daily_cycle(products, daily_state, outcomes)
+        save_json_file(DAILY_STATE_FILE, daily_state)
+        save_json_file(DAILY_CHECK_MARKER_FILE, {"date": today_str})
+        print(f"=== Daily BREAKOUT check for {today_str} done ===")
+    finally:
+        _daily_scan_lock.release()
     return daily_state, outcomes
 
 
@@ -3468,6 +3557,20 @@ def main():
                 f.write(datetime.now(timezone.utc).isoformat())
         except Exception:
             pass
+
+    # Hand handle_scan_command() (Telegram polling thread) a reference to
+    # these SAME dict objects -- must happen after the one-time-reset block
+    # above, which can rebind outcomes to a brand-new dict; grabbing the
+    # reference any earlier would leave /scan mutating a stale, discarded
+    # dict instead of the one main()'s loop actually uses. Must also happen
+    # BEFORE the Telegram thread starts (right below), so /scan can never
+    # see these as still None due to a startup race. See _shared_daily_state
+    # /_shared_outcomes's own docstring above for why a reference is enough
+    # (both are mutated in place, never reassigned, for the rest of the
+    # process's life).
+    global _shared_daily_state, _shared_outcomes
+    _shared_daily_state = daily_state
+    _shared_outcomes = outcomes
 
     print(f"Trading: {'ENABLED' if TRADING_ENABLED else 'DISABLED (set COINBASE_API_KEY / COINBASE_API_SECRET to enable)'}")
     if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
