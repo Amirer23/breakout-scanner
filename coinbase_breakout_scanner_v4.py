@@ -3616,6 +3616,46 @@ def resolve_same_day_tie_with_6h(product_id, day_ts, stop_level, target_level):
         return None
 
 
+def fetch_spread(product_id):
+    """Fetches the current best bid/ask for product_id via Coinbase's
+    public ticker endpoint (GET /products/{id}/ticker) -- read-only market
+    data, no trading key needed, same request pattern as fetch_candles()
+    above. Called ONLY at retest CONFIRMATION time (see
+    spread-slippage-capture-feature-spec-2026-08.md), i.e. the exact
+    moment a real trade would be entered if Amir buys -- not on every
+    scan, so this adds at most one extra request on the rare day a retest
+    actually confirms (historically ~29/month across all 398 pairs).
+
+    This is a slippage LOWER-BOUND estimate, not real slippage: the
+    quoted spread is roughly the minimum cost of a market order large
+    enough to cross it once; a real order can cost more once it walks
+    past the best price level, and only a real fill (Amir actually
+    buying/selling) gives the true number. See the spec doc for the full
+    reasoning and why this doesn't require any real trade to start
+    collecting data.
+
+    Returns a dict {best_bid, best_ask, mid_price, spread_pct} on success,
+    or None on any failure (network, missing/malformed fields, non-
+    positive or crossed quote) -- callers must treat that as "spread
+    unavailable" and continue without it, exactly like
+    resolve_same_day_tie_with_6h()'s failure handling above; this must
+    never block or break retest confirmation itself."""
+    try:
+        data = get_json(f"/products/{product_id}/ticker")
+        if not data:
+            return None
+        bid = float(data["bid"])
+        ask = float(data["ask"])
+        if bid <= 0 or ask <= 0 or ask < bid:
+            return None
+        mid = (bid + ask) / 2
+        spread_pct = (ask - bid) / mid * 100
+        return {"best_bid": bid, "best_ask": ask, "mid_price": mid, "spread_pct": spread_pct}
+    except Exception as e:
+        print(f"  [warn] fetch_spread({product_id}) failed: {e}")
+        return None
+
+
 def open_retest_pending(pending, product_id, resistance, today_str):
     """Called from run_daily_cycle() right where a fresh BREAKOUT alert
     fires (mirrors record_pending_outcome()'s call site exactly). Opens a
@@ -3637,9 +3677,12 @@ def check_pending_retest(pending, tracking, product_id, daily_candles, today_str
     retest condition: low within RETEST_TOUCH_TOLERANCE_PCT% above the
     broken level, AND close back at/above it (spec section 3).
 
-    On confirmation: removes the pending record, opens the T15/T25
-    statistical tracking entries (open_retest_tracks()), and returns an
-    event dict for the caller to pass to notify_retest(). On no
+    On confirmation: removes the pending record, fetches the current
+    bid/ask spread (fetch_spread() -- a slippage lower-bound estimate,
+    see spread-slippage-capture-feature-spec-2026-08.md; None if that
+    fetch fails, never blocks confirmation), opens the T15/T25 statistical
+    tracking entries (open_retest_tracks()) tagged with that spread, and
+    returns an event dict for the caller to pass to notify_retest(). On no
     confirmation: increments days_waited, and drops the record (silently,
     no alert -- an expired watch isn't a notable event) once
     RETEST_MAX_WAIT_DAYS is reached without a hold. Returns None in every
@@ -3655,8 +3698,9 @@ def check_pending_retest(pending, tracking, product_id, daily_candles, today_str
     if low <= touch_band and close >= resistance:
         entry_price = resistance * (1 + RETEST_ENTRY_BUFFER_PCT / 100)
         del pending[product_id]
-        open_retest_tracks(tracking, product_id, entry_price, resistance, today_str)
-        return {"product_id": product_id, "resistance": resistance, "entry_price": entry_price}
+        spread_info = fetch_spread(product_id)
+        open_retest_tracks(tracking, product_id, entry_price, resistance, today_str, spread_info)
+        return {"product_id": product_id, "resistance": resistance, "entry_price": entry_price, "spread_info": spread_info}
 
     rec["days_waited"] += 1
     if rec["days_waited"] >= RETEST_MAX_WAIT_DAYS:
@@ -3664,13 +3708,19 @@ def check_pending_retest(pending, tracking, product_id, daily_candles, today_str
     return None
 
 
-def open_retest_tracks(tracking, product_id, entry_price, resistance, today_str):
+def open_retest_tracks(tracking, product_id, entry_price, resistance, today_str, spread_info=None):
     """Opens one statistical tracking entry per key in RETEST_TARGET_PCTS
     (currently T15 and T25) for a just-confirmed retest event. Appends to
     tracking[product_id] -- a LIST, because the same pair can produce
     multiple retest events over the bot's lifetime, each tracked
     independently (matches the historical backtest, where 74 of 147
-    unique pairs had more than one retest event -- see spec 8.8)."""
+    unique pairs had more than one retest event -- see spec 8.8).
+
+    spread_info is whatever fetch_spread() returned at confirmation time
+    (a dict, or None if that fetch failed) -- stored as-is under
+    "confirmation_spread" so the biweekly report (spec section 6) can
+    aggregate spread_pct across events later. Purely informational: never
+    read by any win/loss/stop/target logic here."""
     tracks = {}
     for key, target_pct in RETEST_TARGET_PCTS.items():
         tracks[key] = {
@@ -3684,6 +3734,7 @@ def open_retest_tracks(tracking, product_id, entry_price, resistance, today_str)
         "entry_price": entry_price,
         "resistance": resistance,
         "tracks": tracks,
+        "confirmation_spread": spread_info,
     })
 
 
@@ -3740,10 +3791,18 @@ def notify_retest(event):
     does, tagged kind="retest_confirmed" so it's distinguishable from
     ordinary breakout/watching entries in that same log."""
     product_id = event["product_id"]
+    spread_info = event.get("spread_info")
+    spread_line = (
+        f"Current spread: {spread_info['spread_pct']:.2f}% (bid {spread_info['best_bid']:.6g} / "
+        f"ask {spread_info['best_ask']:.6g}) -- slippage lower-bound estimate, not a real fill\n"
+        if spread_info else
+        "Current spread: unavailable\n"
+    )
     text = (
         f"🔁 {product_id}: RETEST CONFIRMED\n"
         f"Broken level held: {event['resistance']:.6g}\n"
         f"Simulated entry (level + {RETEST_ENTRY_BUFFER_PCT:g}%): {event['entry_price']:.6g}\n"
+        f"{spread_line}"
         f"Tracking {', '.join(RETEST_TARGET_PCTS.keys())} in parallel (stop ~{RETEST_STOP_PCT:g}%) -- "
         f"see /retest for status. This is a statistical/informational signal, same as the daily BREAKOUT "
         f"alert -- nothing is bought automatically."
