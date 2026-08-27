@@ -306,6 +306,52 @@ EXIT_LEVELS_FILE = _data_path("exit_levels.json")  # structural stop/target watc
 AUTO_ALERT_STOP_PCT = 5     # alert when price falls this % below the current avg entry
 AUTO_ALERT_TARGET_PCT = 10  # alert when price rises this % above the current avg entry
 
+# --- Retest-entry tracking (added 2026-08-26, per claude/retest-entry-
+# logic-spec-2026-08.md in the Anki Capital project -- full spec, backtest
+# numbers (n=318 retest events out of 459 breakouts, 69.3% conversion),
+# and the full decision history live there).
+#
+# WHAT THIS IS: a purely ADDITIVE, statistical/informational layer. It
+# never buys or sells anything and never changes the existing daily
+# BREAKOUT alert in any way -- Amir still decides every trade manually via
+# /buy exactly as before. What it adds:
+#   1. A second, separate "watch for a retest" step after a CONFIRMED daily
+#      breakout: does price come back down near the broken level within
+#      RETEST_MAX_WAIT_DAYS trading days and hold above it (close >=
+#      resistance)? If yes, a SEPARATE "retest confirmed" Telegram alert
+#      fires (see notify_retest()) -- a stronger, later-timed entry signal
+#      than the original breakout alert, per the backtest (retest entries:
+#      +4.54% expectancy vs. -2.38% for chasing the breakout candle).
+#   2. Silent statistical tracking of what a simulated retest-entry trade
+#      would have done, using two parallel fixed-% exit configs (T15/T25,
+#      see RETEST_TARGET_PCTS) against REAL subsequent market prices --
+#      not a backtest replay, live forward-testing, exactly like the three
+#      existing frozen models (Baseline/Model A/Model B) already work.
+#      Only RETEST_DISPLAYED_TRACK is ever shown to Amir (via /retest);
+#      the rest accumulate silently for the biweekly comparison, same
+#      reasoning as why the three frozen models aren't shown on live
+#      alerts either.
+#
+# COST: zero extra API calls in the common case. Both the "is anything
+# pending a retest?" check and the "did an open track's stop/target get
+# hit today?" check reuse the SAME daily candle fetch run_daily_cycle()
+# already does for every one of the ~398 pairs, every day -- see the calls
+# to check_pending_retest()/update_retest_tracks() inside run_daily_cycle()
+# below. The ONLY extra network call this can ever trigger is the rare
+# same-day-tie 6H resolution (see resolve_same_day_tie_with_6h()), and
+# even that only fires on the specific day a specific open track's stop
+# AND target are both crossed in the same daily candle -- a handful of
+# times total across the whole tracked population, not a per-cycle cost.
+RETEST_MAX_WAIT_DAYS = int(os.environ.get("RETEST_MAX_WAIT_DAYS", "20"))            # trading days to wait for a retest before giving up
+RETEST_TOUCH_TOLERANCE_PCT = float(os.environ.get("RETEST_TOUCH_TOLERANCE_PCT", "1.0"))  # "touch" = daily low within this % above the broken level
+RETEST_ENTRY_BUFFER_PCT = float(os.environ.get("RETEST_ENTRY_BUFFER_PCT", "0.3"))   # simulated entry = resistance * (1 + this%) -- same buffer as BREAKOUT_BUFFER_PCT, see spec 8.1
+RETEST_STOP_PCT = float(os.environ.get("RETEST_STOP_PCT", "3.0"))                   # shared stop for both tracks below (spec 8.5/8.8)
+RETEST_TARGET_PCTS = {"T15": 15.0, "T25": 25.0}                                     # both tracked in parallel; only one shown live (spec 8.6)
+RETEST_DISPLAYED_TRACK = "T15"                                                      # which key of RETEST_TARGET_PCTS is surfaced to Amir; the rest stay silent
+
+RETEST_PENDING_FILE = _data_path("retest_pending.json")     # breakout events currently awaiting a retest, one open record per product_id
+RETEST_TRACKING_FILE = _data_path("retest_tracking.json")   # confirmed retest events + their T15/T25 statistical tracking, list per product_id
+
 # --- Outcome tracking (win-rate stats for breakout signals) -----------------
 OUTCOMES_FILE = _data_path("outcomes.json")           # pending + resolved trade outcomes
 STATS_FILE = _data_path("stats.json")                 # cumulative win/loss counters
@@ -2536,6 +2582,15 @@ def _compute_position_ledger():
                                                 executed via the bot for
                                                 this product
            "total_fees_usd": float,         -- cumulative fees on those sells
+           "total_cost_basis_usd": float,   -- cumulative cost basis of
+                                                every unit ever sold (added
+                                                2026-08-26) -- divide
+                                                realized_pnl_usd by this to
+                                                get the fee-adjusted %
+                                                return, since the $ figure
+                                                alone doesn't say whether
+                                                it's a small position or a
+                                                large one (see /pnl)
            "closed_lots": int,              -- how many times this symbol
                                                 has gone from open -> fully
                                                 flat via the bot
@@ -2588,12 +2643,21 @@ def _compute_position_ledger():
 
             r = realized.setdefault(product_id, {
                 "realized_pnl_usd": 0.0, "total_fees_usd": 0.0, "closed_lots": 0,
+                "total_cost_basis_usd": 0.0,
                 "last_close": None,
                 "_pnl_at_prev_close": 0.0, "_sold_qty_since_close": 0.0,
                 "_sold_proceeds_since_close": 0.0, "_last_avg_entry": None,
             })
             r["realized_pnl_usd"] += pnl
             r["total_fees_usd"] += fee
+            # Cumulative cost basis of every unit ever sold for this
+            # product (added 2026-08-26, requested by Amir: the $ P&L
+            # alone doesn't say whether a +$200 trade is +10% on a $2,000
+            # position or +0.01% on $2,000,000 -- realized_pnl_usd /
+            # total_cost_basis_usd below is that %, fee-adjusted the same
+            # way pnl already is (cost_of_sold folds in the BUY-side fee
+            # via avg_cost_per_unit, see the cost basis comment above).
+            r["total_cost_basis_usd"] += cost_of_sold
             r["_last_avg_entry"] = avg_cost_per_unit
             r["_sold_qty_since_close"] += sell_qty
             r["_sold_proceeds_since_close"] += sell_qty * price
@@ -2976,7 +3040,14 @@ def handle_pnl_command():
     P&L on OPEN positions): this is the "how have I actually done"
     number, covering trades that are already finished. Scope is the same
     as /positions -- bot-tracked trades only (see _compute_position_ledger()'s
-    docstring)."""
+    docstring).
+
+    Shows a % return alongside every $ figure (added 2026-08-26, per
+    Amir: "+$200 doesn't say much on its own -- is that from a $2,000
+    position (10%) or a $2,000,000 one?"). % = realized_pnl_usd /
+    total_cost_basis_usd, both already fee-adjusted the same way -- see
+    _compute_position_ledger()'s docstring for exactly what that basis
+    covers."""
     _open, realized = _compute_position_ledger()
     closed = {pid: r for pid, r in realized.items() if r["closed_lots"] > 0}
     if not closed:
@@ -2985,17 +3056,22 @@ def handle_pnl_command():
     lines = ["📊 Realized P&L (bot-tracked trades, after fees):"]
     total_pnl = 0.0
     total_fees = 0.0
+    total_cost_basis = 0.0
     for product_id, r in sorted(closed.items()):
         icon = "🟢" if r["realized_pnl_usd"] >= 0 else "🔴"
+        basis = r.get("total_cost_basis_usd") or 0.0
+        pct_s = f" ({r['realized_pnl_usd'] / basis * 100:+.1f}%)" if basis > 0 else ""
         lines.append(
-            f"\n{product_id}: {icon} {r['realized_pnl_usd']:+,.2f}$ "
+            f"\n{product_id}: {icon} {r['realized_pnl_usd']:+,.2f}${pct_s} "
             f"({r['closed_lots']} closed round-trip{'s' if r['closed_lots'] != 1 else ''}, "
             f"{r['total_fees_usd']:.2f}$ fees)"
         )
         total_pnl += r["realized_pnl_usd"]
         total_fees += r["total_fees_usd"]
+        total_cost_basis += basis
     icon = "🟢" if total_pnl >= 0 else "🔴"
-    lines.append(f"\n{icon} Total realized P&L: {total_pnl:+,.2f}$  (total fees: {total_fees:.2f}$)")
+    total_pct_s = f" ({total_pnl / total_cost_basis * 100:+.1f}%)" if total_cost_basis > 0 else ""
+    lines.append(f"\n{icon} Total realized P&L: {total_pnl:+,.2f}${total_pct_s}  (total fees: {total_fees:.2f}$)")
     telegram_send("\n".join(lines))
 
 
@@ -3179,8 +3255,19 @@ def handle_scan_command():
         try:
             products = fetch_products()
             telegram_send(f"🔍 Manual scan starting: {len(products)} pairs. This can take a few minutes -- new confirmed breakouts will alert as they're found.")
-            run_daily_cycle(products, _shared_daily_state, _shared_outcomes)
+            # Retest tracking (added 2026-08-26) isn't shared via a
+            # module-level global like daily_state/outcomes -- it's loaded
+            # fresh and saved back here, same as check_and_run_daily_pass()
+            # does for the automatic pass. Fine either way since
+            # handle_retest_command()/other readers always load fresh from
+            # disk too; the _daily_scan_lock this function already holds
+            # rules out a concurrent writer.
+            retest_pending = load_json_file(RETEST_PENDING_FILE, {})
+            retest_tracking = load_json_file(RETEST_TRACKING_FILE, {})
+            run_daily_cycle(products, _shared_daily_state, _shared_outcomes, retest_pending, retest_tracking)
             save_json_file(DAILY_STATE_FILE, _shared_daily_state)
+            save_json_file(RETEST_PENDING_FILE, retest_pending)
+            save_json_file(RETEST_TRACKING_FILE, retest_tracking)
             telegram_send(f"✅ Manual scan done: {len(products)} pairs checked.")
         except Exception as e:
             print(f"  [error] manual /scan failed: {e}")
@@ -3293,6 +3380,8 @@ def parse_and_handle_command(text):
         handle_pnl_command()
     elif cmd == "/alerts":
         handle_alerts_command()
+    elif cmd == "/retest":
+        handle_retest_command()
     elif cmd == "/cancelalert":
         if len(parts) != 2:
             telegram_send("Usage: /cancelalert PRODUCT_ID\n(get the PRODUCT_ID from /alerts)")
@@ -3339,6 +3428,8 @@ def parse_and_handle_command(text):
             "/pnl -- realized P&L (after fees) across every position the bot has fully closed\n"
             "/alerts -- watched positions: structural stop/target AND return-based "
             f"(-{AUTO_ALERT_STOP_PCT}%/+{AUTO_ALERT_TARGET_PCT}% from avg entry) stop/target, side by side\n"
+            "/retest -- retest-entry status: pairs awaiting a retest, and open T15/T25 statistical tracks "
+            "(informational only, no trade is placed by this)\n"
             "/cancelalert PRODUCT_ID -- stop watching a position (both structural and return-based) -- ID from /alerts\n"
             "/history [N] -- last N trades placed via the bot (default 10, no upper limit)\n"
             "/stats -- win/loss track record of breakout ALERTS (not trades)\n"
@@ -3472,7 +3563,240 @@ def run_cycle(products, state, outcomes):
     return state, outcomes
 
 
-def run_daily_cycle(products, daily_state, outcomes):
+def resolve_same_day_tie_with_6h(product_id, day_ts, stop_level, target_level):
+    """When a single DAILY candle shows BOTH a stop level and a target
+    level crossed (low <= stop_level AND high >= target_level), the daily
+    bar alone can't say which happened first -- see spec 8.8 for the full
+    writeup (this was discovered running the historical backtest, where it
+    materially changed the win-rate numbers: T25 25.5%->18.8% optimistic
+    vs. conservative, before this fix was applied here).
+
+    Fetches recent 6H candles (granularity=SIX_HOUR_GRANULARITY_SECONDS)
+    for product_id -- the same endpoint/pattern as fetch_6h_context() --
+    and filters to just the ~4 buckets covering day_ts (the UTC calendar
+    day of the daily candle in question). Coinbase's candle fetch always
+    returns the MOST RECENT ~300 candles, so this only works for a day
+    within that recent window -- true by construction here, since this is
+    only ever called live, on TODAY's daily candle, right after it closes.
+
+    Returns "stop_first", "target_first", or None (fetch failed, too few
+    6H candles for that day, or still tied even at 6H resolution -- same
+    residual ambiguity the historical analysis found in ~9-13% of ties).
+    Caller treats None the same as the conservative assumption (stop
+    first) -- see spec 8.8's own conservative-default treatment of the
+    unresolved remainder."""
+    try:
+        candles = fetch_candles(product_id, granularity=SIX_HOUR_GRANULARITY_SECONDS)
+        if not candles:
+            return None
+        day_candles = [c for c in candles if day_ts <= c[0] < day_ts + 86400]
+        day_candles.sort(key=lambda c: c[0])
+        if not day_candles:
+            return None
+        stop_bucket, target_bucket = None, None
+        for i, c in enumerate(day_candles):
+            lo, hi = c[1], c[2]
+            if stop_bucket is None and lo <= stop_level:
+                stop_bucket = i
+            if target_bucket is None and hi >= target_level:
+                target_bucket = i
+        if stop_bucket is None and target_bucket is None:
+            return None  # neither actually confirms at 6H resolution -- shouldn't happen, but be defensive
+        if stop_bucket is None:
+            return "target_first"
+        if target_bucket is None:
+            return "stop_first"
+        if stop_bucket < target_bucket:
+            return "stop_first"
+        if target_bucket < stop_bucket:
+            return "target_first"
+        return None  # same 6H bucket -- still tied, same residual case as spec 8.8
+    except Exception as e:
+        print(f"  [warn] resolve_same_day_tie_with_6h({product_id}) failed: {e}")
+        return None
+
+
+def open_retest_pending(pending, product_id, resistance, today_str):
+    """Called from run_daily_cycle() right where a fresh BREAKOUT alert
+    fires (mirrors record_pending_outcome()'s call site exactly). Opens a
+    new "awaiting retest" watch for product_id. If one was already open for
+    this product_id (rare -- would need a second fresh breakout while the
+    first retest watch is still pending), it's simply replaced with the
+    new, presumably more current, resistance level rather than trying to
+    track two overlapping watches per pair -- kept deliberately simple for
+    v1, see spec section 6."""
+    pending[product_id] = {"resistance": resistance, "opened_date": today_str, "days_waited": 0}
+
+
+def check_pending_retest(pending, tracking, product_id, daily_candles, today_str):
+    """Called for EVERY product_id in run_daily_cycle()'s per-product loop
+    (not just ones with a fresh breakout today) -- reuses that SAME daily
+    candle fetch, no extra API call. If product_id has an open "awaiting
+    retest" record, checks TODAY's already-closed daily candle (the last
+    entry in daily_candles, same as analyze_daily() reads) against the
+    retest condition: low within RETEST_TOUCH_TOLERANCE_PCT% above the
+    broken level, AND close back at/above it (spec section 3).
+
+    On confirmation: removes the pending record, opens the T15/T25
+    statistical tracking entries (open_retest_tracks()), and returns an
+    event dict for the caller to pass to notify_retest(). On no
+    confirmation: increments days_waited, and drops the record (silently,
+    no alert -- an expired watch isn't a notable event) once
+    RETEST_MAX_WAIT_DAYS is reached without a hold. Returns None in every
+    non-confirming case."""
+    rec = pending.get(product_id)
+    if not rec or not daily_candles:
+        return None
+    today_candle = daily_candles[-1]
+    low, high, close = today_candle[1], today_candle[2], today_candle[4]
+    resistance = rec["resistance"]
+    touch_band = resistance * (1 + RETEST_TOUCH_TOLERANCE_PCT / 100)
+
+    if low <= touch_band and close >= resistance:
+        entry_price = resistance * (1 + RETEST_ENTRY_BUFFER_PCT / 100)
+        del pending[product_id]
+        open_retest_tracks(tracking, product_id, entry_price, resistance, today_str)
+        return {"product_id": product_id, "resistance": resistance, "entry_price": entry_price}
+
+    rec["days_waited"] += 1
+    if rec["days_waited"] >= RETEST_MAX_WAIT_DAYS:
+        del pending[product_id]  # expired -- no hold within the window, silently give up watching
+    return None
+
+
+def open_retest_tracks(tracking, product_id, entry_price, resistance, today_str):
+    """Opens one statistical tracking entry per key in RETEST_TARGET_PCTS
+    (currently T15 and T25) for a just-confirmed retest event. Appends to
+    tracking[product_id] -- a LIST, because the same pair can produce
+    multiple retest events over the bot's lifetime, each tracked
+    independently (matches the historical backtest, where 74 of 147
+    unique pairs had more than one retest event -- see spec 8.8)."""
+    tracks = {}
+    for key, target_pct in RETEST_TARGET_PCTS.items():
+        tracks[key] = {
+            "status": "open",
+            "stop_level": entry_price * (1 - RETEST_STOP_PCT / 100),
+            "target_level": entry_price * (1 + target_pct / 100),
+            "days_open": 0,
+        }
+    tracking.setdefault(product_id, []).append({
+        "opened_date": today_str,
+        "entry_price": entry_price,
+        "resistance": resistance,
+        "tracks": tracks,
+    })
+
+
+def update_retest_tracks(tracking, product_id, daily_candles, today_ts, today_str):
+    """Called for every product_id in run_daily_cycle()'s per-product
+    loop, same reuse of that day's already-fetched daily_candles as
+    check_pending_retest(). For every still-OPEN track (T15/T25) on every
+    retest event recorded for this product_id, checks today's daily candle
+    against that track's stop_level/target_level.
+
+    Same-day tie handling (spec 8.8): if BOTH are crossed on today's
+    candle, resolves the true order with a live 6H fetch
+    (resolve_same_day_tie_with_6h()) instead of guessing -- this is the
+    ONLY place this module makes an extra API call beyond the daily scan
+    it's already doing, and only on the rare day this specific situation
+    happens. Falls back to the conservative assumption (stop first / loss)
+    if that 6H fetch can't resolve it either, exactly like the historical
+    analysis in spec 8.8 does for its own small unresolved residual."""
+    events = tracking.get(product_id)
+    if not events or not daily_candles:
+        return
+    today_candle = daily_candles[-1]
+    low, high = today_candle[1], today_candle[2]
+
+    for ev in events:
+        for key, tr in ev["tracks"].items():
+            if tr["status"] != "open":
+                continue
+            stop_hit = low <= tr["stop_level"]
+            target_hit = high >= tr["target_level"]
+            if stop_hit and target_hit:
+                order = resolve_same_day_tie_with_6h(product_id, today_ts, tr["stop_level"], tr["target_level"])
+                if order == "target_first":
+                    tr["status"] = "win"
+                else:
+                    tr["status"] = "loss"  # "stop_first" or unresolved (None) -- conservative default, see spec 8.8
+                tr["resolved_date"] = today_str
+                tr["resolved_via_6h_tie_break"] = True
+            elif stop_hit:
+                tr["status"] = "loss"
+                tr["resolved_date"] = today_str
+            elif target_hit:
+                tr["status"] = "win"
+                tr["resolved_date"] = today_str
+            else:
+                tr["days_open"] += 1
+
+
+def notify_retest(event):
+    """Sends the separate "retest confirmed" Telegram alert (spec section
+    5, decision Q5) -- deliberately its own message, not a field tacked
+    onto the original BREAKOUT alert, so the two remain independently
+    readable/actionable. Also appends to ALERTS_LOG_FILE like notify()
+    does, tagged kind="retest_confirmed" so it's distinguishable from
+    ordinary breakout/watching entries in that same log."""
+    product_id = event["product_id"]
+    text = (
+        f"🔁 {product_id}: RETEST CONFIRMED\n"
+        f"Broken level held: {event['resistance']:.6g}\n"
+        f"Simulated entry (level + {RETEST_ENTRY_BUFFER_PCT:g}%): {event['entry_price']:.6g}\n"
+        f"Tracking {', '.join(RETEST_TARGET_PCTS.keys())} in parallel (stop ~{RETEST_STOP_PCT:g}%) -- "
+        f"see /retest for status. This is a statistical/informational signal, same as the daily BREAKOUT "
+        f"alert -- nothing is bought automatically."
+    )
+    telegram_send(text)
+    log_event = {"time": datetime.now(timezone.utc).isoformat(), "kind": "retest_confirmed", **event}
+    with open(ALERTS_LOG_FILE, "a") as f:
+        f.write(json.dumps(log_event) + "\n")
+
+
+def handle_retest_command():
+    """Handle the /retest Telegram command (added 2026-08-26) -- status
+    snapshot of the retest-entry statistical layer: pairs currently
+    "awaiting retest" (with days remaining), and every OPEN T15/T25
+    tracked event with its running stop/target. Read-only, mirrors
+    /alerts' shape for the existing exit-level watching. Resolved
+    (win/loss) tracks are intentionally omitted here to keep this a
+    live-status view, not a report -- the biweekly comparison (spec
+    section 6) covers the accumulated win-rate/expectancy numbers."""
+    pending = load_json_file(RETEST_PENDING_FILE, {})
+    tracking = load_json_file(RETEST_TRACKING_FILE, {})
+
+    lines = ["🔁 Retest-entry status:"]
+
+    if pending:
+        lines.append("\nAwaiting retest:")
+        for product_id, rec in sorted(pending.items()):
+            days_left = max(0, RETEST_MAX_WAIT_DAYS - rec["days_waited"])
+            lines.append(f"  {product_id}: level {rec['resistance']:.6g}, {days_left}d left to retest")
+    else:
+        lines.append("\nAwaiting retest: none.")
+
+    open_lines = []
+    for product_id, events in sorted(tracking.items()):
+        for ev in events:
+            open_tracks = {k: t for k, t in ev["tracks"].items() if t["status"] == "open"}
+            if not open_tracks:
+                continue
+            parts = []
+            for key, t in sorted(open_tracks.items()):
+                shown = " (displayed)" if key == RETEST_DISPLAYED_TRACK else ""
+                parts.append(f"{key}{shown}: stop {t['stop_level']:.6g} / target {t['target_level']:.6g}")
+            open_lines.append(f"  {product_id} (entry {ev['entry_price']:.6g}): " + "  ·  ".join(parts))
+    if open_lines:
+        lines.append("\nOpen tracks:")
+        lines.extend(open_lines)
+    else:
+        lines.append("\nOpen tracks: none.")
+
+    telegram_send("\n".join(lines))
+
+
+def run_daily_cycle(products, daily_state, outcomes, retest_pending, retest_tracking):
     """The CONFIRMED-breakout pass -- runs once per UTC calendar day (see
     check_and_run_daily_pass in main()), never on the regular 5-minute
     cycle, against fully-closed DAILY candles for every product.
@@ -3534,8 +3858,31 @@ def run_daily_cycle(products, daily_state, outcomes):
                 record_pending_outcome(outcomes, product_id, result, datetime.now(timezone.utc))
                 save_json_file(OUTCOMES_FILE, outcomes)
 
+                # Retest-entry tracking (added 2026-08-26, spec section 5):
+                # a fresh confirmed breakout opens a NEW "awaiting retest"
+                # watch, independent of and in addition to the alert above.
+                today_str = datetime.now(timezone.utc).date().isoformat()
+                open_retest_pending(retest_pending, product_id, result["resistance"], today_str)
+                save_json_file(RETEST_PENDING_FILE, retest_pending)
+
             daily_state[product_id] = {"signal": new_signal, "updated": datetime.now(timezone.utc).isoformat()}
             save_json_file(DAILY_STATE_FILE, daily_state)
+
+            # Retest-entry: check every pair with an open "awaiting retest"
+            # watch, and update every OPEN T15/T25 track -- for EVERY
+            # product_id, not just ones with a fresh breakout today, using
+            # the SAME daily_candles already fetched above (spec section
+            # 5: "this covers every breakout event the scan identifies on
+            # all 398 pairs, every day, regardless of whether Amir buys").
+            today_str = datetime.now(timezone.utc).date().isoformat()
+            today_ts = daily_candles[-1][0]
+            retest_event = check_pending_retest(retest_pending, retest_tracking, product_id, daily_candles, today_str)
+            if retest_event:
+                notify_retest(retest_event)
+                save_json_file(RETEST_PENDING_FILE, retest_pending)
+                save_json_file(RETEST_TRACKING_FILE, retest_tracking)
+            update_retest_tracks(retest_tracking, product_id, daily_candles, today_ts, today_str)
+            save_json_file(RETEST_TRACKING_FILE, retest_tracking)
 
         except Exception:
             print(f"  [error] unexpected failure on {product_id} (daily)")
@@ -3544,7 +3891,7 @@ def run_daily_cycle(products, daily_state, outcomes):
         if (i + 1) % 50 == 0:
             print(f"  ...daily-scanned {i + 1}/{len(products)}")
 
-    return daily_state, outcomes
+    return daily_state, outcomes, retest_pending, retest_tracking
 
 
 def check_and_run_daily_pass(products, daily_state, outcomes):
@@ -3576,8 +3923,13 @@ def check_and_run_daily_pass(products, daily_state, outcomes):
         return daily_state, outcomes
     try:
         print(f"\n=== New UTC day ({today_str}) -- running daily BREAKOUT check on {len(products)} pairs ===")
-        daily_state, outcomes = run_daily_cycle(products, daily_state, outcomes)
+        retest_pending = load_json_file(RETEST_PENDING_FILE, {})
+        retest_tracking = load_json_file(RETEST_TRACKING_FILE, {})
+        daily_state, outcomes, retest_pending, retest_tracking = run_daily_cycle(
+            products, daily_state, outcomes, retest_pending, retest_tracking)
         save_json_file(DAILY_STATE_FILE, daily_state)
+        save_json_file(RETEST_PENDING_FILE, retest_pending)
+        save_json_file(RETEST_TRACKING_FILE, retest_tracking)
         save_json_file(DAILY_CHECK_MARKER_FILE, {"date": today_str})
         print(f"=== Daily BREAKOUT check for {today_str} done ===")
     finally:
@@ -3591,6 +3943,9 @@ def main():
     print(f"Daily breakout check: DAILY_LOOKBACK_CANDLES={DAILY_LOOKBACK_CANDLES}d, once per UTC day "
           f"(\"BREAKOUT\" only ever fires from this daily check now -- the hourly scan tops out at \"watching\")")
     print(f"Outcome tracking: evaluate after {EVALUATION_HOURS}h, win>={SUCCESS_THRESHOLD_PCT}% loss<=-{FAILURE_THRESHOLD_PCT}%")
+    print(f"Retest-entry tracking: wait<={RETEST_MAX_WAIT_DAYS}d, touch tol={RETEST_TOUCH_TOLERANCE_PCT}%, "
+          f"entry buffer={RETEST_ENTRY_BUFFER_PCT}%, stop={RETEST_STOP_PCT}%, targets={RETEST_TARGET_PCTS} "
+          f"(displayed: {RETEST_DISPLAYED_TRACK}) -- statistical only, no auto-buy")
 
     state = load_state()
     daily_state = load_json_file(DAILY_STATE_FILE, {})
