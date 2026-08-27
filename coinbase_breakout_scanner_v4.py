@@ -1661,16 +1661,42 @@ def _format_display_time(iso_str):
         return str(iso_str)[:16].replace("T", " ") + " UTC"
 
 
-def telegram_send(text):
-    """Send a plain message to the configured Telegram chat (fire-and-forget)."""
+def telegram_send(text, parse_mode=None):
+    """Send a message to the configured Telegram chat (fire-and-forget).
+
+    parse_mode is optional (e.g. "HTML") and only used where a caller
+    explicitly wants rich formatting -- currently just notify_retest(),
+    so it can bold its header/frame to stand out while scrolling (Telegram
+    has no way to set custom text COLOR for bot messages at all, only
+    structural formatting like bold/italic/etc -- see
+    telegram-retest-visual-emphasis-2026-08.md). Every other existing
+    call site keeps sending plain text exactly as before -- omitting
+    parse_mode is unchanged behavior.
+
+    Telegram silently returns a non-200 (not a requests exception) if the
+    markup is malformed -- since this bot sends real trading alerts,
+    failing to notice that would mean an alert silently never arriving.
+    So a formatted send that comes back non-200 is retried once as plain
+    text, stripped of markup risk, rather than just logged and dropped."""
     if not (TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID):
         return
+    payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
     try:
-        session.post(
+        resp = session.post(
             f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+            json=payload,
             timeout=10,
         )
+        if parse_mode and resp.status_code != 200:
+            print(f"  [warn] Telegram send with parse_mode={parse_mode} failed "
+                  f"({resp.status_code}) -- retrying as plain text so the alert still arrives")
+            session.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": text},
+                timeout=10,
+            )
     except requests.RequestException as e:
         print(f"  [error] Telegram send failed: {e}")
 
@@ -3798,8 +3824,19 @@ def notify_retest(event):
         if spread_info else
         "Current spread: unavailable\n"
     )
+    # Bold header + a repeated-character frame line (Telegram has no way to
+    # set custom text color for bot messages -- this is the closest visual
+    # emphasis available, see telegram-retest-visual-emphasis-2026-08.md).
+    # HTML parse_mode is used (not MarkdownV2) because it only needs
+    # escaping for &/</>, none of which appear in product ids or the
+    # :.6g-formatted numbers here -- MarkdownV2 would need escaping for
+    # ".", "-", "(", ")" etc, which DO appear, and one missed escape would
+    # silently break the whole alert (see telegram_send()'s docstring).
+    frame = "━" * 24
     text = (
-        f"🔁 {product_id}: RETEST CONFIRMED\n"
+        f"{frame}\n"
+        f"<b>🔁 RETEST CONFIRMED — {product_id}</b>\n"
+        f"{frame}\n"
         f"Broken level held: {event['resistance']:.6g}\n"
         f"Simulated entry (level + {RETEST_ENTRY_BUFFER_PCT:g}%): {event['entry_price']:.6g}\n"
         f"{spread_line}"
@@ -3807,7 +3844,7 @@ def notify_retest(event):
         f"see /retest for status. This is a statistical/informational signal, same as the daily BREAKOUT "
         f"alert -- nothing is bought automatically."
     )
-    telegram_send(text)
+    telegram_send(text, parse_mode="HTML")
     log_event = {"time": datetime.now(timezone.utc).isoformat(), "kind": "retest_confirmed", **event}
     with open(ALERTS_LOG_FILE, "a") as f:
         f.write(json.dumps(log_event) + "\n")
