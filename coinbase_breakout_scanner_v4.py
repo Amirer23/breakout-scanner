@@ -352,6 +352,23 @@ RETEST_DISPLAYED_TRACK = "T15"                                                  
 RETEST_PENDING_FILE = _data_path("retest_pending.json")     # breakout events currently awaiting a retest, one open record per product_id
 RETEST_TRACKING_FILE = _data_path("retest_tracking.json")   # confirmed retest events + their T15/T25 statistical tracking, list per product_id
 
+# Same-day shadow tracking (added 2026-08-28). Before this date, a retest
+# could confirm on the SAME daily candle that produced the breakout itself
+# (check_pending_retest() was called on the just-opened pending record
+# within the same per-product loop pass, using that day's own candle) --
+# e.g. SOL-USD 27.8.2026: the breakout candle's own low (100.52) already
+# sat below the touch band, so the "retest" fired off intraday noise on
+# the breakout day itself, not a genuine later pullback. Fixed below: the
+# real trigger now requires at least one full day to pass after a watch
+# opens. This file preserves the OLD same-day-confirm behavior as a
+# statistics-only shadow track -- same entry formula, same T15/T25
+# stop/target logic (reuses open_retest_tracks()/update_retest_tracks()
+# unchanged) -- so Amir can compare the same-day pattern's real win/loss
+# rate against the true (day-gapped) retest strategy once enough events
+# accumulate. NEVER sends a Telegram alert and NEVER gates the real
+# pending/tracking above -- see /retest_sameday for read-only stats.
+RETEST_TRACKING_SAMEDAY_FILE = _data_path("retest_tracking_sameday.json")
+
 # --- Outcome tracking (win-rate stats for breakout signals) -----------------
 OUTCOMES_FILE = _data_path("outcomes.json")           # pending + resolved trade outcomes
 STATS_FILE = _data_path("stats.json")                 # cumulative win/loss counters
@@ -3352,10 +3369,13 @@ def handle_scan_command():
             # rules out a concurrent writer.
             retest_pending = load_json_file(RETEST_PENDING_FILE, {})
             retest_tracking = load_json_file(RETEST_TRACKING_FILE, {})
-            run_daily_cycle(products, _shared_daily_state, _shared_outcomes, retest_pending, retest_tracking)
+            retest_tracking_sameday = load_json_file(RETEST_TRACKING_SAMEDAY_FILE, {})
+            run_daily_cycle(products, _shared_daily_state, _shared_outcomes, retest_pending, retest_tracking,
+                             retest_tracking_sameday)
             save_json_file(DAILY_STATE_FILE, _shared_daily_state)
             save_json_file(RETEST_PENDING_FILE, retest_pending)
             save_json_file(RETEST_TRACKING_FILE, retest_tracking)
+            save_json_file(RETEST_TRACKING_SAMEDAY_FILE, retest_tracking_sameday)
             telegram_send(f"✅ Manual scan done: {len(products)} pairs checked.")
         except Exception as e:
             print(f"  [error] manual /scan failed: {e}")
@@ -3470,6 +3490,8 @@ def parse_and_handle_command(text):
         handle_alerts_command()
     elif cmd == "/retest":
         handle_retest_command()
+    elif cmd == "/retest_sameday":
+        handle_retest_sameday_command()
     elif cmd == "/cancelalert":
         if len(parts) != 2:
             telegram_send("Usage: /cancelalert PRODUCT_ID\n(get the PRODUCT_ID from /alerts)")
@@ -3518,6 +3540,8 @@ def parse_and_handle_command(text):
             f"(-{AUTO_ALERT_STOP_PCT}%/+{AUTO_ALERT_TARGET_PCT}% from avg entry) stop/target, side by side\n"
             "/retest -- retest-entry status: pairs awaiting a retest, and open T15/T25 statistical tracks "
             "(informational only, no trade is placed by this)\n"
+            "/retest_sameday -- shadow stats only: the old same-day-confirm pattern's win/loss record, "
+            "kept separately for comparison -- never a live signal\n"
             "/cancelalert PRODUCT_ID -- stop watching a position (both structural and return-based) -- ID from /alerts\n"
             "/history [N] -- last N trades placed via the bot (default 10, no upper limit)\n"
             "/stats -- win/loss track record of breakout ALERTS (not trades)\n"
@@ -3756,7 +3780,7 @@ def open_retest_pending(pending, product_id, resistance, today_str):
     pending[product_id] = {"resistance": resistance, "opened_date": today_str, "days_waited": 0}
 
 
-def check_pending_retest(pending, tracking, product_id, daily_candles, today_str):
+def check_pending_retest(pending, tracking, product_id, daily_candles, today_str, sameday_tracking=None):
     """Called for EVERY product_id in run_daily_cycle()'s per-product loop
     (not just ones with a fresh breakout today) -- reuses that SAME daily
     candle fetch, no extra API call. If product_id has an open "awaiting
@@ -3765,16 +3789,27 @@ def check_pending_retest(pending, tracking, product_id, daily_candles, today_str
     retest condition: low within RETEST_TOUCH_TOLERANCE_PCT% above the
     broken level, AND close back at/above it (spec section 3).
 
-    On confirmation: removes the pending record, fetches the current
-    bid/ask spread (fetch_spread() -- a slippage lower-bound estimate,
-    see spread-slippage-capture-feature-spec-2026-08.md; None if that
-    fetch fails, never blocks confirmation), opens the T15/T25 statistical
-    tracking entries (open_retest_tracks()) tagged with that spread, and
-    returns an event dict for the caller to pass to notify_retest(). On no
-    confirmation: increments days_waited, and drops the record (silently,
-    no alert -- an expired watch isn't a notable event) once
-    RETEST_MAX_WAIT_DAYS is reached without a hold. Returns None in every
-    non-confirming case."""
+    Fixed 2026-08-28: the real trigger can never confirm on the SAME day a
+    watch was opened (rec["opened_date"] == today_str) -- it now requires
+    at least one full day to pass, so this reflects an actual later
+    pullback, not the breakout candle's own intraday noise (see
+    mfe-mae-outcome-tracking... no -- see the retest-sameday-shadow spec
+    for the SOL-USD 27.8.2026 case that surfaced this). On that opening
+    day, if the OLD same-day condition would have matched, it's logged
+    ONLY into sameday_tracking (when passed) via open_retest_tracks() --
+    statistics-only, no Telegram alert, never touches `pending`/`tracking`.
+
+    On a real confirmation (day 2+): removes the pending record, fetches
+    the current bid/ask spread (fetch_spread() -- a slippage lower-bound
+    estimate, see spread-slippage-capture-feature-spec-2026-08.md; None if
+    that fetch fails, never blocks confirmation), opens the T15/T25
+    statistical tracking entries (open_retest_tracks()) tagged with that
+    spread, and returns an event dict for the caller to pass to
+    notify_retest(). On no confirmation: increments days_waited, and drops
+    the record (silently, no alert -- an expired watch isn't a notable
+    event) once RETEST_MAX_WAIT_DAYS is reached without a hold. Returns
+    None in every non-confirming case (including every same-day case,
+    shadow-logged or not)."""
     rec = pending.get(product_id)
     if not rec or not daily_candles:
         return None
@@ -3782,8 +3817,19 @@ def check_pending_retest(pending, tracking, product_id, daily_candles, today_str
     low, high, close = today_candle[1], today_candle[2], today_candle[4]
     resistance = rec["resistance"]
     touch_band = resistance * (1 + RETEST_TOUCH_TOLERANCE_PCT / 100)
+    condition_met = low <= touch_band and close >= resistance
 
-    if low <= touch_band and close >= resistance:
+    if rec["opened_date"] == today_str:
+        if sameday_tracking is not None and condition_met:
+            entry_price = resistance * (1 + RETEST_ENTRY_BUFFER_PCT / 100)
+            open_retest_tracks(sameday_tracking, product_id, entry_price, resistance, today_str, spread_info=None)
+        # Never confirms today regardless -- the watch just opened this
+        # same cycle. Don't burn a wait-day either; the clock starts
+        # tomorrow, so RETEST_MAX_WAIT_DAYS still means that many full
+        # days, not that-many-minus-one.
+        return None
+
+    if condition_met:
         entry_price = resistance * (1 + RETEST_ENTRY_BUFFER_PCT / 100)
         del pending[product_id]
         spread_info = fetch_spread(product_id)
@@ -3954,7 +4000,40 @@ def handle_retest_command():
     telegram_send("\n".join(lines))
 
 
-def run_daily_cycle(products, daily_state, outcomes, retest_pending, retest_tracking):
+def handle_retest_sameday_command():
+    """Handle the /retest_sameday Telegram command (added 2026-08-28) --
+    read-only resolved win/loss/open counts for the same-day shadow
+    tracker (see RETEST_TRACKING_SAMEDAY_FILE's comment). Statistics only:
+    this data never gated a live alert or a real trade, and never will --
+    it exists purely so the same-day pattern's actual success rate can be
+    compared against the true (day-gapped) retest strategy once enough
+    events accumulate. Unlike /retest, this DOES show resolved (win/loss)
+    counts, since a live-status view isn't the point here -- the whole
+    point of this file is the accumulated track record."""
+    tracking = load_json_file(RETEST_TRACKING_SAMEDAY_FILE, {})
+    counts = {key: {} for key in RETEST_TARGET_PCTS}
+    total_events = 0
+    for events in tracking.values():
+        for ev in events:
+            total_events += 1
+            for key, tr in ev["tracks"].items():
+                counts.setdefault(key, {})
+                counts[key][tr["status"]] = counts[key].get(tr["status"], 0) + 1
+
+    lines = [
+        f"📊 Same-day shadow retest stats ({total_events} events) -- "
+        f"statistics only, never a live signal or a real trade:"
+    ]
+    for key in RETEST_TARGET_PCTS:
+        c = counts.get(key, {})
+        win, loss, open_ = c.get("win", 0), c.get("loss", 0), c.get("open", 0)
+        decided = win + loss
+        win_rate = (win / decided * 100) if decided > 0 else 0.0
+        lines.append(f"  {key}: {win}W / {loss}L / {open_} open (win rate {win_rate:.0f}% of {decided} decided)")
+    telegram_send("\n".join(lines))
+
+
+def run_daily_cycle(products, daily_state, outcomes, retest_pending, retest_tracking, retest_tracking_sameday=None):
     """The CONFIRMED-breakout pass -- runs once per UTC calendar day (see
     check_and_run_daily_pass in main()), never on the regular 5-minute
     cycle, against fully-closed DAILY candles for every product.
@@ -4034,13 +4113,21 @@ def run_daily_cycle(products, daily_state, outcomes, retest_pending, retest_trac
             # all 398 pairs, every day, regardless of whether Amir buys").
             today_str = datetime.now(timezone.utc).date().isoformat()
             today_ts = daily_candles[-1][0]
-            retest_event = check_pending_retest(retest_pending, retest_tracking, product_id, daily_candles, today_str)
+            retest_event = check_pending_retest(
+                retest_pending, retest_tracking, product_id, daily_candles, today_str,
+                sameday_tracking=retest_tracking_sameday)
             if retest_event:
                 notify_retest(retest_event)
                 save_json_file(RETEST_PENDING_FILE, retest_pending)
                 save_json_file(RETEST_TRACKING_FILE, retest_tracking)
             update_retest_tracks(retest_tracking, product_id, daily_candles, today_ts, today_str)
             save_json_file(RETEST_TRACKING_FILE, retest_tracking)
+            if retest_tracking_sameday is not None:
+                # Shadow track walked to resolution the same way as the
+                # real one, every cycle -- statistics only, see
+                # RETEST_TRACKING_SAMEDAY_FILE's comment.
+                update_retest_tracks(retest_tracking_sameday, product_id, daily_candles, today_ts, today_str)
+                save_json_file(RETEST_TRACKING_SAMEDAY_FILE, retest_tracking_sameday)
 
         except Exception:
             print(f"  [error] unexpected failure on {product_id} (daily)")
@@ -4049,7 +4136,7 @@ def run_daily_cycle(products, daily_state, outcomes, retest_pending, retest_trac
         if (i + 1) % 50 == 0:
             print(f"  ...daily-scanned {i + 1}/{len(products)}")
 
-    return daily_state, outcomes, retest_pending, retest_tracking
+    return daily_state, outcomes, retest_pending, retest_tracking, retest_tracking_sameday
 
 
 def check_and_run_daily_pass(products, daily_state, outcomes):
@@ -4083,11 +4170,13 @@ def check_and_run_daily_pass(products, daily_state, outcomes):
         print(f"\n=== New UTC day ({today_str}) -- running daily BREAKOUT check on {len(products)} pairs ===")
         retest_pending = load_json_file(RETEST_PENDING_FILE, {})
         retest_tracking = load_json_file(RETEST_TRACKING_FILE, {})
-        daily_state, outcomes, retest_pending, retest_tracking = run_daily_cycle(
-            products, daily_state, outcomes, retest_pending, retest_tracking)
+        retest_tracking_sameday = load_json_file(RETEST_TRACKING_SAMEDAY_FILE, {})
+        daily_state, outcomes, retest_pending, retest_tracking, retest_tracking_sameday = run_daily_cycle(
+            products, daily_state, outcomes, retest_pending, retest_tracking, retest_tracking_sameday)
         save_json_file(DAILY_STATE_FILE, daily_state)
         save_json_file(RETEST_PENDING_FILE, retest_pending)
         save_json_file(RETEST_TRACKING_FILE, retest_tracking)
+        save_json_file(RETEST_TRACKING_SAMEDAY_FILE, retest_tracking_sameday)
         save_json_file(DAILY_CHECK_MARKER_FILE, {"date": today_str})
         print(f"=== Daily BREAKOUT check for {today_str} done ===")
     finally:
