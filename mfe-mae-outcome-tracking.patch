@@ -1,0 +1,106 @@
+diff --git a/coinbase_breakout_scanner_v4.py b/coinbase_breakout_scanner_v4.py
+index dae3697..0d4dc6a 100644
+--- a/coinbase_breakout_scanner_v4.py
++++ b/coinbase_breakout_scanner_v4.py
+@@ -1323,6 +1323,13 @@ def record_pending_outcome(outcomes, product_id, result, now):
+     outcomes[key] = {
+         "product_id": product_id,
+         "entry_price": result["last_close"],
++        # Running high/low seen since the alert fired, updated every main
++        # cycle by update_pending_outcome_extremes() below -- initialized
++        # to entry_price so a coin that resolves before ever being updated
++        # (e.g. process restart) still reports a defined (zero) MFE/MAE
++        # instead of crashing on a missing key.
++        "peak_price": result["last_close"],
++        "trough_price": result["last_close"],
+         "resistance": result["resistance"],
+         "target_price": nearest_target[0].get("price"),
+         "target_pct": nearest_target[0].get("pct"),
+@@ -1333,6 +1340,46 @@ def record_pending_outcome(outcomes, product_id, result, now):
+     }
+ 
+ 
++def update_pending_outcome_extremes(outcomes):
++    """Called once per main scan cycle, BEFORE evaluate_pending_outcomes(),
++    for every still-open (unresolved) pending breakout outcome: fetches the
++    current price and updates the running peak/trough seen since the alert
++    fired.
++
++    Why this exists: evaluate_pending_outcomes() only ever looks at price
++    ONCE, exactly EVALUATION_HOURS after the alert -- so its win/loss/flat
++    verdict (and the pct_change shown in the OUTCOME message) reflects
++    wherever the price happened to be at that single moment, not the path
++    it took. A coin that spiked +12% and then reversed hard looks
++    identical, at that one snapshot, to one that fell straight through --
++    even though those are very different patterns for spotting a
++    spike-then-crash setup before entry. Tracking the running peak/trough
++    here (same per-cycle, get_current_price()-based pattern already used
++    by check_exit_levels() for real positions) lets the eventual OUTCOME
++    message report both, without needing to re-fetch historical candles
++    after the fact.
++
++    Best-effort: a failed price fetch for one product just leaves its
++    peak/trough unchanged for this cycle, same as evaluate_pending_outcomes
++    already does when fetch_candles fails."""
++    changed = False
++    for entry in outcomes.values():
++        if entry.get("resolved"):
++            continue
++        price = get_current_price(entry["product_id"])
++        time.sleep(REQUEST_PACING_SECONDS)
++        if price is None:
++            continue
++        entry_price = entry["entry_price"]
++        if price > entry.get("peak_price", entry_price):
++            entry["peak_price"] = price
++            changed = True
++        if price < entry.get("trough_price", entry_price):
++            entry["trough_price"] = price
++            changed = True
++    return outcomes, changed
++
++
+ def evaluate_pending_outcomes(outcomes, stats, now):
+     """Checks any pending breakout outcomes whose evaluation time has arrived,
+     fetches the current price, classifies win/loss/flat, sends a Telegram
+@@ -1361,10 +1408,24 @@ def evaluate_pending_outcomes(outcomes, stats, now):
+         else:
+             outcome = "flat"
+ 
++        # Path since the alert fired, from the running peak/trough
++        # update_pending_outcome_extremes() has been maintaining every
++        # cycle -- falls back to entry_price (0% MFE/MAE) for any entry
++        # that predates this field or was never updated (e.g. resolved on
++        # the very first cycle after being recorded).
++        peak_price = entry.get("peak_price", entry_price)
++        trough_price = entry.get("trough_price", entry_price)
++        mfe_pct = ((peak_price - entry_price) / entry_price) * 100
++        mae_pct = ((trough_price - entry_price) / entry_price) * 100
++
+         entry["resolved"] = True
+         entry["outcome"] = outcome
+         entry["exit_price"] = current_price
+         entry["pct_change"] = pct_change
++        entry["peak_price"] = peak_price
++        entry["trough_price"] = trough_price
++        entry["mfe_pct"] = mfe_pct
++        entry["mae_pct"] = mae_pct
+         entry["resolved_time"] = now.isoformat()
+ 
+         stats["total"] = stats.get("total", 0) + 1
+@@ -1376,6 +1437,7 @@ def evaluate_pending_outcomes(outcomes, stats, now):
+         text = (
+             f"{icon} OUTCOME: {product_id}\n"
+             f"Entry: {entry_price:.6g} -> Now: {current_price:.6g} ({pct_change:+.2f}%)\n"
++            f"Path since alert: high {mfe_pct:+.2f}% / low {mae_pct:+.2f}%\n"
+             f"Result: {outcome.upper()}\n"
+             f"Track record: {stats.get('win',0)}W / {stats.get('loss',0)}L / {stats.get('flat',0)}F "
+             f"(win rate {win_rate:.0f}% of decided trades, {stats['total']} total)"
+@@ -4119,6 +4181,7 @@ def main():
+                 # expected, not a hang.
+                 daily_state, outcomes = check_and_run_daily_pass(products, daily_state, outcomes)
+ 
++            outcomes, _extremes_changed = update_pending_outcome_extremes(outcomes)
+             outcomes, stats = evaluate_pending_outcomes(outcomes, stats, now)
+             save_json_file(OUTCOMES_FILE, outcomes)
+             save_json_file(STATS_FILE, stats)
