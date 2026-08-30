@@ -1985,7 +1985,13 @@ def _try_fetch_fill_info(order_id):
 
 def execute_buy(product_id, usd_amount):
     """Market-buy usd_amount worth of product_id. Reports result via Telegram."""
+    if is_trading_paused():
+        reason = _load_control_state().get("pause_reason") or "paused"
+        audit_log("buy_blocked_paused", product_id, usd_amount=usd_amount, reason=reason)
+        telegram_send(f"⛔ BUY blocked -- trading is paused ({reason}). Send /resume first.")
+        return
     order_id = str(uuid.uuid4())
+    audit_log("buy_attempt", product_id, usd_amount=usd_amount, kind="market")
     try:
         resp = _to_dict(_trade_client.market_order_buy(
             client_order_id=order_id, product_id=product_id, quote_size=str(usd_amount)))
@@ -2006,12 +2012,16 @@ def execute_buy(product_id, usd_amount):
                 "amount_usd": usd_amount, "base_size": filled_size, "price": avg_price,
                 "fee_usd": fee, "order_id": order_id,
             })
+            audit_log("buy_executed", product_id, usd_amount=usd_amount, order_id=order_id,
+                      price=avg_price, base_size=filled_size)
             _maybe_init_exit_levels(product_id)
             _update_pct_levels(product_id)
         else:
+            audit_log("buy_failed", product_id, usd_amount=usd_amount, error=str(resp.get('error_response', resp)))
             telegram_send(f"❌ BUY failed: {product_id} for ${usd_amount}\n{resp.get('error_response', resp)}")
     except Exception as e:
         detail = _coinbase_error_detail(e)
+        audit_log("buy_failed", product_id, usd_amount=usd_amount, error=f"{e}{detail}")
         telegram_send(f"❌ BUY error: {product_id} for ${usd_amount}\n{e}{detail}")
         print(f"  [error] buy order failed: {e}{detail}")
         traceback.print_exc()
@@ -2024,6 +2034,7 @@ def execute_sell(product_id, usd_amount):
     order_id = str(uuid.uuid4())
     price = get_current_price(product_id)
     if not price:
+        audit_log("sell_failed", product_id, usd_amount=usd_amount, error="couldn't fetch current price")
         telegram_send(f"❌ SELL failed: couldn't fetch current price for {product_id}")
         return
     # See _size_str_for_order()'s docstring -- floors to product_id's REAL
@@ -2033,6 +2044,7 @@ def execute_sell(product_id, usd_amount):
     # See _precision_fallback_note()'s docstring -- must be read right after
     # the _size_str_for_order() call above.
     precision_note = _precision_fallback_note(product_id)
+    audit_log("sell_attempt", product_id, usd_amount=usd_amount, kind="market")
     try:
         resp = _to_dict(_trade_client.market_order_sell(
             client_order_id=order_id, product_id=product_id, base_size=base_size_str))
@@ -2049,11 +2061,15 @@ def execute_sell(product_id, usd_amount):
                 "amount_usd": usd_amount, "base_size": filled_size or base_size_str, "price": avg_price,
                 "fee_usd": fee, "order_id": order_id,
             })
+            audit_log("sell_executed", product_id, usd_amount=usd_amount, order_id=order_id,
+                      price=avg_price, base_size=filled_size or base_size_str)
             _notify_if_position_closed(product_id)
         else:
+            audit_log("sell_failed", product_id, usd_amount=usd_amount, error=str(resp.get('error_response', resp)))
             telegram_send(f"❌ SELL failed: {product_id} for ${usd_amount}\n{resp.get('error_response', resp)}{precision_note}")
     except Exception as e:
         detail = _coinbase_error_detail(e)
+        audit_log("sell_failed", product_id, usd_amount=usd_amount, error=f"{e}{detail}")
         telegram_send(f"❌ SELL error: {product_id} for ${usd_amount}\n{e}{detail}{precision_note}")
         print(f"  [error] sell order failed: {e}{detail}")
         traceback.print_exc()
@@ -2074,6 +2090,11 @@ def execute_buy_all(product_id, limit_price=None):
     grown past the cap since it was set, and the cap exists precisely so
     no single command can move more than the user has explicitly allowed
     without raising it first."""
+    if is_trading_paused():
+        reason = _load_control_state().get("pause_reason") or "paused"
+        audit_log("buy_blocked_paused", product_id, kind="buy_all", reason=reason)
+        telegram_send(f"⛔ BUY ALL blocked -- trading is paused ({reason}). Send /resume first.")
+        return
     quote_currency = product_id.split("-")[1] if "-" in product_id else None
     if quote_currency not in ("USD", "USDC"):
         telegram_send(f"❌ BUY ALL failed: {product_id} isn't quoted in USD or USDC -- can't tell which cash balance to spend.")
@@ -2170,6 +2191,8 @@ def execute_buy_all(product_id, limit_price=None):
                     "amount_usd": spend, "base_size": base_size_str, "price": limit_price,
                     "order_id": attempt_order_id,
                 })
+                audit_log("buy_executed", product_id, kind="limit_all", usd_amount=spend,
+                          order_id=attempt_order_id, price=limit_price, base_size=base_size_str)
                 _pending_new_order_ids.add(attempt_order_id)
                 return
             if error_text is None:
@@ -2178,9 +2201,11 @@ def execute_buy_all(product_id, limit_price=None):
                 last_error_text = error_text
                 spend_fraction -= 0.005
                 continue
+            audit_log("buy_failed", product_id, kind="limit_all", usd_amount=spend, error=error_text)
             telegram_send(f"❌ LIMIT BUY ALL failed: {product_id} ~{spend:,.2f} {quote_currency} @ {limit_price}\n{error_text}{precision_note}")
             print(f"  [error] limit buy-all order failed: {error_text}")
             return
+        audit_log("buy_failed", product_id, kind="limit_all", error=f"insufficient funds after retries, last: {last_error_text}")
         telegram_send(
             f"❌ LIMIT BUY ALL failed: {product_id} -- still INSUFFICIENT_FUND after retrying down to "
             f"{spend_fraction * 100:.1f}% of available balance ({available:,.2f} {quote_currency}). "
@@ -2188,6 +2213,7 @@ def execute_buy_all(product_id, limit_price=None):
         )
         return
 
+    audit_log("buy_attempt", product_id, kind="buy_all", usd_amount=available)
     try:
         resp = _to_dict(_trade_client.market_order_buy(
             client_order_id=order_id, product_id=product_id, quote_size=str(available)))
@@ -2204,12 +2230,17 @@ def execute_buy_all(product_id, limit_price=None):
                 "amount_usd": available, "base_size": filled_size, "price": avg_price,
                 "fee_usd": fee, "order_id": order_id,
             })
+            audit_log("buy_executed", product_id, kind="buy_all", usd_amount=available,
+                      order_id=order_id, price=avg_price, base_size=filled_size)
             _maybe_init_exit_levels(product_id)
             _update_pct_levels(product_id)
         else:
+            audit_log("buy_failed", product_id, kind="buy_all", usd_amount=available,
+                      error=str(resp.get('error_response', resp)))
             telegram_send(f"❌ BUY ALL failed: {product_id}\n{resp.get('error_response', resp)}")
     except Exception as e:
         detail = _coinbase_error_detail(e)
+        audit_log("buy_failed", product_id, kind="buy_all", usd_amount=available, error=f"{e}{detail}")
         telegram_send(f"❌ BUY ALL error: {product_id}\n{e}{detail}")
         print(f"  [error] buy-all order failed: {e}{detail}")
         traceback.print_exc()
@@ -2315,16 +2346,22 @@ def execute_sell_all(product_id, limit_price=None):
                     "amount_usd": usd_value, "base_size": base_size_str, "price": limit_price,
                     "order_id": order_id,
                 })
+                audit_log("sell_executed", product_id, kind="limit_all", usd_amount=usd_value,
+                          order_id=order_id, price=limit_price, base_size=base_size_str)
                 _pending_new_order_ids.add(order_id)
             else:
+                audit_log("sell_failed", product_id, kind="limit_all", usd_amount=usd_value,
+                          error=str(resp.get('error_response', resp)))
                 telegram_send(f"❌ LIMIT SELL ALL failed: {product_id} {available:.8g} {base_currency} @ {limit_price}\n{resp.get('error_response', resp)}{precision_note}")
         except Exception as e:
             detail = _coinbase_error_detail(e)
+            audit_log("sell_failed", product_id, kind="limit_all", usd_amount=usd_value, error=f"{e}{detail}")
             telegram_send(f"❌ LIMIT SELL ALL error: {product_id} {available:.8g} {base_currency} @ {limit_price}\n{e}{detail}{precision_note}")
             print(f"  [error] limit sell-all order failed: {e}{detail}")
             traceback.print_exc()
         return
 
+    audit_log("sell_attempt", product_id, kind="sell_all", usd_amount=usd_value)
     try:
         resp = _to_dict(_trade_client.market_order_sell(
             client_order_id=order_id, product_id=product_id, base_size=base_size_str))
@@ -2341,11 +2378,16 @@ def execute_sell_all(product_id, limit_price=None):
                 "amount_usd": usd_value, "base_size": filled_size or base_size_str, "price": avg_price,
                 "fee_usd": fee, "order_id": order_id,
             })
+            audit_log("sell_executed", product_id, kind="sell_all", usd_amount=usd_value,
+                      order_id=order_id, price=avg_price, base_size=filled_size or base_size_str)
             _notify_if_position_closed(product_id)
         else:
+            audit_log("sell_failed", product_id, kind="sell_all", usd_amount=usd_value,
+                      error=str(resp.get('error_response', resp)))
             telegram_send(f"❌ SELL ALL failed: {product_id}\n{resp.get('error_response', resp)}{precision_note}")
     except Exception as e:
         detail = _coinbase_error_detail(e)
+        audit_log("sell_failed", product_id, kind="sell_all", usd_amount=usd_value, error=f"{e}{detail}")
         telegram_send(f"❌ SELL ALL error: {product_id}\n{e}{detail}{precision_note}")
         print(f"  [error] sell-all order failed: {e}{detail}")
         traceback.print_exc()
@@ -2358,6 +2400,11 @@ def execute_buy_limit(product_id, usd_amount, limit_price):
     usd_amount is converted to a base-currency size using limit_price
     (not the current market price), since that's the price it will
     actually transact at if/when it fills."""
+    if is_trading_paused():
+        reason = _load_control_state().get("pause_reason") or "paused"
+        audit_log("buy_blocked_paused", product_id, usd_amount=usd_amount, kind="limit", reason=reason)
+        telegram_send(f"⛔ LIMIT BUY blocked -- trading is paused ({reason}). Send /resume first.")
+        return
     order_id = str(uuid.uuid4())
     # Floor (not round) so the reserved cost never exceeds usd_amount --
     # see _size_str_for_order()'s docstring for why plain rounding, AND a
@@ -2368,6 +2415,7 @@ def execute_buy_limit(product_id, usd_amount, limit_price):
     # See _precision_fallback_note()'s docstring -- must be read right after
     # the _size_str_for_order() call above.
     precision_note = _precision_fallback_note(product_id)
+    audit_log("buy_attempt", product_id, usd_amount=usd_amount, kind="limit", price=limit_price)
     try:
         resp = _to_dict(_trade_client.limit_order_gtc_buy(
             client_order_id=order_id, product_id=product_id,
@@ -2393,11 +2441,16 @@ def execute_buy_limit(product_id, usd_amount, limit_price):
                 "amount_usd": usd_amount, "base_size": base_size_str, "price": limit_price,
                 "order_id": order_id,
             })
+            audit_log("buy_executed", product_id, usd_amount=usd_amount, kind="limit",
+                      order_id=order_id, price=limit_price, base_size=base_size_str)
             _pending_new_order_ids.add(order_id)
         else:
+            audit_log("buy_failed", product_id, usd_amount=usd_amount, kind="limit",
+                      error=str(resp.get('error_response', resp)))
             telegram_send(f"❌ LIMIT BUY failed: {product_id} ~${usd_amount} @ {limit_price}\n{resp.get('error_response', resp)}{precision_note}")
     except Exception as e:
         detail = _coinbase_error_detail(e)
+        audit_log("buy_failed", product_id, usd_amount=usd_amount, kind="limit", error=f"{e}{detail}")
         telegram_send(f"❌ LIMIT BUY error: {product_id} ~${usd_amount} @ {limit_price}\n{e}{detail}{precision_note}")
         print(f"  [error] limit buy order failed: {e}{detail}")
         traceback.print_exc()
@@ -2416,6 +2469,7 @@ def execute_sell_limit(product_id, usd_amount, limit_price):
     # See _precision_fallback_note()'s docstring -- must be read right after
     # the _size_str_for_order() call above.
     precision_note = _precision_fallback_note(product_id)
+    audit_log("sell_attempt", product_id, usd_amount=usd_amount, kind="limit", price=limit_price)
     try:
         resp = _to_dict(_trade_client.limit_order_gtc_sell(
             client_order_id=order_id, product_id=product_id,
@@ -2437,11 +2491,16 @@ def execute_sell_limit(product_id, usd_amount, limit_price):
                 "amount_usd": usd_amount, "base_size": base_size_str, "price": limit_price,
                 "order_id": order_id,
             })
+            audit_log("sell_executed", product_id, usd_amount=usd_amount, kind="limit",
+                      order_id=order_id, price=limit_price, base_size=base_size_str)
             _pending_new_order_ids.add(order_id)
         else:
+            audit_log("sell_failed", product_id, usd_amount=usd_amount, kind="limit",
+                      error=str(resp.get('error_response', resp)))
             telegram_send(f"❌ LIMIT SELL failed: {product_id} ~${usd_amount} @ {limit_price}\n{resp.get('error_response', resp)}{precision_note}")
     except Exception as e:
         detail = _coinbase_error_detail(e)
+        audit_log("sell_failed", product_id, usd_amount=usd_amount, kind="limit", error=f"{e}{detail}")
         telegram_send(f"❌ LIMIT SELL error: {product_id} ~${usd_amount} @ {limit_price}\n{e}{detail}{precision_note}")
         print(f"  [error] limit sell order failed: {e}{detail}")
         traceback.print_exc()
@@ -3038,6 +3097,286 @@ def check_exit_levels():
         save_json_file(EXIT_LEVELS_FILE, levels)
 
 
+# ============================================================================
+# Kill switch (/pause, /resume, /emergencystop) + daily/weekly loss circuit
+# breaker, and the append-only order audit log -- spec:
+# portfolio-risk-and-safety-infrastructure-spec-2026-08.md, חלק ב׳ §1
+# (kill switch), §6 (circuit breaker), §8 (audit log). Decided 29.8.2026:
+# DAILY_LOSS_LIMIT_PCT=3.0, WEEKLY_LOSS_LIMIT_PCT=8.0. Added 30.8.2026.
+# ============================================================================
+
+BOT_CONTROL_FILE = _data_path("bot_control_state.json")
+EQUITY_HISTORY_FILE = _data_path("equity_history.json")
+AUDIT_LOG_FILE = _data_path("audit_log.jsonl")
+
+DAILY_LOSS_LIMIT_PCT = float(os.environ.get("DAILY_LOSS_LIMIT_PCT", "3.0"))
+WEEKLY_LOSS_LIMIT_PCT = float(os.environ.get("WEEKLY_LOSS_LIMIT_PCT", "8.0"))
+
+
+def audit_log(event_type, product_id, **fields):
+    """Append one structured record to audit_log.jsonl -- the permanent,
+    append-only trail of every order ATTEMPT (executed, blocked, or
+    failed), not just successful fills (trades.json/record_trade() already
+    covers those, ledger-style). Spec:
+    portfolio-risk-and-safety-infrastructure-spec-2026-08.md, חלק ב׳ §8.
+
+    event_type examples: "buy_attempt", "buy_executed", "buy_failed",
+    "buy_blocked_paused", "sell_attempt", "sell_executed", "sell_failed",
+    "emergencystop_sell", "pause", "resume", "circuit_breaker_trip".
+    fields: whatever's relevant for that event -- usd_amount, price,
+    order_id, reason, source, etc. record_trade() (trades.json) is still
+    the source of truth for actual fills used by /history, /pnl,
+    _compute_position_ledger(); this is the wider trail that also
+    captures what did NOT happen and why -- a rejected/blocked attempt
+    never reaches record_trade() at all.
+
+    Never raises and never blocks the caller -- a failure to write here is
+    an observability gap, not a trading gap, so it's swallowed with a
+    console warning exactly like every other non-critical I/O in this
+    file (see e.g. compute_total_equity_usd()'s per-currency price-lookup
+    warning below)."""
+    try:
+        entry = {
+            "time": datetime.now(timezone.utc).isoformat(),
+            "event": event_type,
+            "product_id": product_id,
+            **fields,
+        }
+        with open(AUDIT_LOG_FILE, "a") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        print(f"  [warn] audit_log({event_type}, {product_id}) failed to write: {e}")
+
+
+def _load_control_state():
+    """Persisted (not in-memory) pause/kill-switch state -- must survive a
+    process restart (Render redeploy, crash+respawn), or a paused bot could
+    silently un-pause itself just by bouncing."""
+    return load_json_file(BOT_CONTROL_FILE, {
+        "paused": False,
+        "pause_reason": None,
+        "paused_at": None,
+        "pause_source": None,          # "manual" or "circuit_breaker"
+        "emergency_stopped_at": None,  # last time /emergencystop actually fired, or None
+    })
+
+
+def _save_control_state(state):
+    save_json_file(BOT_CONTROL_FILE, state)
+
+
+def is_trading_paused():
+    """True if new BUY entries should be blocked right now -- manual
+    /pause, an automatic circuit-breaker trip, or the aftermath of
+    /emergencystop (which also sets paused=True). Called at the start of
+    every function that can place a buy order (execute_buy/execute_buy_all/
+    execute_buy_limit) -- sells are never gated, see handle_emergencystop_
+    command()'s docstring for why."""
+    return _load_control_state().get("paused", False)
+
+
+def compute_total_equity_usd():
+    """Real total account value right now: every free+held balance,
+    converted to USD at current prices. Same underlying call as /balance
+    and /positions (get_balances()) -- just summed into one number instead
+    of shown per-currency. Returns None if a price lookup fails for some
+    held currency, so a circuit-breaker check can be skipped for one cycle
+    rather than acting on a wrong, partial equity figure."""
+    try:
+        balances = get_balances()
+    except Exception as e:
+        print(f"  [warn] compute_total_equity_usd: get_balances failed: {e}")
+        return None
+    total = 0.0
+    for currency, avail, hold in balances:
+        qty = avail + hold
+        if qty <= 0:
+            continue
+        if currency in ("USD", "USDC"):
+            total += qty
+            continue
+        price = get_current_price(f"{currency}-USD") or get_current_price(f"{currency}-USDC")
+        if price is None:
+            print(f"  [warn] compute_total_equity_usd: no price for {currency} -- excluding it this cycle (equity is a slight underestimate)")
+            continue
+        total += qty * price
+    return total
+
+
+def _record_equity_snapshot(now, equity):
+    """Append today's equity to a small rolling history -- one entry per
+    UTC calendar day (first call of the day wins; doesn't keep overwriting
+    intraday, since 'equity at day start' is the fixed baseline daily P&L
+    is measured against, not a moving target). Kept to the most recent 10
+    days -- the 7-day weekly window plus a little slack."""
+    history = load_json_file(EQUITY_HISTORY_FILE, [])
+    today_str = now.strftime("%Y-%m-%d")
+    if history and history[-1]["date"] == today_str:
+        return history
+    history.append({"date": today_str, "equity_usd": equity})
+    history = history[-10:]
+    save_json_file(EQUITY_HISTORY_FILE, history)
+    return history
+
+
+def _equity_n_days_ago(history, now, n):
+    """Best-effort equity snapshot ~n days back. Falls back to the OLDEST
+    snapshot on file if history doesn't go back that far yet (e.g. the
+    first week after this feature is deployed) -- an imperfect weekly
+    baseline beats skipping the weekly check entirely for a week."""
+    if not history:
+        return None
+    target = (now - timedelta(days=n)).strftime("%Y-%m-%d")
+    for entry in history:
+        if entry["date"] >= target:
+            return entry["equity_usd"]
+    return history[0]["equity_usd"]
+
+
+def check_circuit_breaker():
+    """Call once per main-loop cycle (see main(), right after
+    check_exit_levels(), inside the `if TRADING_ENABLED:` block). Computes
+    today's and this-week's cumulative P&L as a % of equity at the start
+    of that window; if either breached its configured limit, flips the
+    persisted pause flag on and sends ONE alert -- re-checks
+    _load_control_state() first and returns immediately if already paused
+    (whatever the reason), so this never re-alerts every cycle.
+
+    Deliberately never un-pauses on its own (per spec §II.6): a human
+    confirms with /resume before trading resumes after a real drawdown,
+    exactly like a manual /pause today."""
+    state = _load_control_state()
+    if state.get("paused"):
+        return
+
+    now = datetime.now(timezone.utc)
+    equity = compute_total_equity_usd()
+    if equity is None or equity <= 0:
+        return
+
+    history = _record_equity_snapshot(now, equity)
+    day_start_equity = history[-1]["equity_usd"] if history else equity
+    week_start_equity = _equity_n_days_ago(history, now, 7) or equity
+
+    daily_pct = (equity - day_start_equity) / day_start_equity * 100 if day_start_equity else 0.0
+    weekly_pct = (equity - week_start_equity) / week_start_equity * 100 if week_start_equity else 0.0
+
+    reason = None
+    if daily_pct <= -DAILY_LOSS_LIMIT_PCT:
+        reason = f"daily P&L {daily_pct:+.2f}% breached -{DAILY_LOSS_LIMIT_PCT:g}%"
+    elif weekly_pct <= -WEEKLY_LOSS_LIMIT_PCT:
+        reason = f"weekly P&L {weekly_pct:+.2f}% breached -{WEEKLY_LOSS_LIMIT_PCT:g}%"
+    if reason is None:
+        return
+
+    _save_control_state({
+        "paused": True, "pause_reason": reason,
+        "paused_at": now.isoformat(), "pause_source": "circuit_breaker",
+        "emergency_stopped_at": None,
+    })
+    audit_log("circuit_breaker_trip", None, reason=reason, equity_usd=round(equity, 2),
+              daily_pct=round(daily_pct, 3), weekly_pct=round(weekly_pct, 3))
+    telegram_send(
+        f"🛑 Circuit breaker triggered: {reason}\n"
+        f"New /buy orders are now blocked. Existing positions keep running normally "
+        f"(stop/target alerts still active).\n"
+        f"Send /resume when you're ready to re-enable manually."
+    )
+
+
+# --- new Telegram commands ---------------------------------------------------
+
+def handle_pause_command():
+    """/pause -- stop new BUY entries only. Existing positions keep running
+    exactly as today (stop/target alerts still fire, still exit normally).
+    The 'everyday' kill-switch action -- see spec §II.1."""
+    state = _load_control_state()
+    if state.get("paused"):
+        telegram_send(f"Already paused ({state.get('pause_reason') or 'manual'}). Send /resume to re-enable.")
+        return
+    _save_control_state({
+        "paused": True, "pause_reason": "manual (/pause)",
+        "paused_at": datetime.now(timezone.utc).isoformat(), "pause_source": "manual",
+        "emergency_stopped_at": None,
+    })
+    audit_log("pause", None, source="manual")
+    telegram_send("⏸ Paused. New /buy orders are blocked. Existing positions keep running normally (stop/target still active). Send /resume to re-enable.")
+
+
+def handle_resume_command():
+    """/resume -- manually clear a pause, whether it was set by /pause,
+    /emergencystop, or the automatic circuit breaker. Always manual, on
+    purpose -- see check_circuit_breaker()'s docstring."""
+    state = _load_control_state()
+    if not state.get("paused"):
+        telegram_send("Not currently paused.")
+        return
+    _save_control_state({
+        "paused": False, "pause_reason": None, "paused_at": None,
+        "pause_source": None, "emergency_stopped_at": state.get("emergency_stopped_at"),
+    })
+    audit_log("resume", None, previous_reason=state.get("pause_reason"))
+    telegram_send("▶️ Resumed. New /buy orders are allowed again.")
+
+
+def handle_emergencystop_command(confirmed):
+    """/emergencystop -- force-closes every open bot-held position RIGHT
+    NOW via market sell, then pauses new entries. One-directional and
+    expensive (market-order slippage on an immediate forced close) --
+    reserved for a real emergency, not the everyday 'stop for a bit' case
+    (that's /pause). Requires a second /emergencystop CONFIRM to actually
+    fire, so a single fat-fingered /emergencystop can't nuke the account
+    by accident -- the first call only shows what WOULD be sold."""
+    if not TRADING_ENABLED:
+        telegram_send("Trading is not enabled -- COINBASE_API_KEY / COINBASE_API_SECRET are not set on the server.")
+        return
+    try:
+        balances = get_balances()
+    except Exception as e:
+        detail = _coinbase_error_detail(e)
+        telegram_send(f"❌ Failed to fetch balances: {e}{detail}")
+        return
+    positions = [(c, a + h) for c, a, h in balances if c not in ("USD", "USDC") and (a + h) > 0]
+
+    if not positions:
+        telegram_send("No open positions to close. Pausing new entries anyway.")
+        handle_pause_command()
+        return
+
+    if not confirmed:
+        lines = "\n".join(f"  {c}: {qty:.8g}" for c, qty in positions)
+        telegram_send(
+            f"⚠️ /emergencystop will MARKET-SELL all of these RIGHT NOW:\n{lines}\n\n"
+            f"This is immediate and one-directional (market-order slippage applies).\n"
+            f"Send /emergencystop CONFIRM to proceed, or /pause instead if you just want to stop new entries."
+        )
+        return
+
+    telegram_send(f"🚨 EMERGENCY STOP: closing {len(positions)} position(s) now...")
+    audit_log("emergencystop_initiated", None, positions=[{"currency": c, "qty": qty} for c, qty in positions])
+    failures = []
+    for currency, qty in positions:
+        product_id = f"{currency}-USD"
+        if not get_current_price(product_id):
+            product_id = f"{currency}-USDC"
+        try:
+            execute_sell_all(product_id, None)  # reuses the existing "/sell PRODUCT_ID all" market path
+            audit_log("emergencystop_sell", product_id, qty=qty)
+        except Exception as e:
+            print(f"  [error] emergencystop: failed to close {product_id}: {e}")
+            audit_log("emergencystop_sell_failed", product_id, qty=qty, error=str(e))
+            failures.append(currency)
+
+    now = datetime.now(timezone.utc).isoformat()
+    _save_control_state({
+        "paused": True, "pause_reason": "emergency stop", "paused_at": now,
+        "pause_source": "manual", "emergency_stopped_at": now,
+    })
+    if failures:
+        telegram_send(f"⚠️ Could not close: {', '.join(failures)} -- check /balance and close manually.")
+    telegram_send("🚨 Emergency stop complete. New /buy orders are blocked. Send /resume when ready.")
+
+
 def send_heartbeat():
     """Send a Telegram health snapshot -- called periodically from main()'s
     loop (every HEARTBEAT_INTERVAL_HOURS) and on-demand via /status
@@ -3062,6 +3401,9 @@ def send_heartbeat():
     if _health["last_error"]:
         lines.append(f"Last error ({_health['last_error_time']}): {_health['last_error']}")
     lines.append(f"Trading: {'ENABLED' if TRADING_ENABLED else 'DISABLED'}")
+    ctrl = _load_control_state()
+    if ctrl.get("paused"):
+        lines.append(f"⏸ PAUSED -- {ctrl.get('pause_reason')} (since {ctrl.get('paused_at')})")
     telegram_send("\n".join(lines))
 
 
@@ -3517,6 +3859,13 @@ def parse_and_handle_command(text):
         handle_stats_command()
     elif cmd == "/status":
         handle_status_command()
+    elif cmd == "/pause":
+        handle_pause_command()
+    elif cmd == "/resume":
+        handle_resume_command()
+    elif cmd == "/emergencystop":
+        confirmed = len(parts) == 2 and parts[1].upper() == "CONFIRM"
+        handle_emergencystop_command(confirmed)
     elif cmd == "/scan":
         handle_scan_command()
     elif cmd == "/help":
@@ -3547,6 +3896,10 @@ def parse_and_handle_command(text):
             "/stats -- win/loss track record of breakout ALERTS (not trades)\n"
             "/status -- bot health snapshot on demand (uptime, last cycle, errors) -- also sent automatically every "
             f"{HEARTBEAT_INTERVAL_HOURS:g}h as a heartbeat\n"
+            "/pause -- stop new BUY entries only; existing positions keep running normally (stop/target still active)\n"
+            "/resume -- manually clear a pause, whatever set it (manual /pause, circuit breaker, or /emergencystop)\n"
+            "/emergencystop -- shows what would be closed; /emergencystop CONFIRM market-sells every open position "
+            "RIGHT NOW and pauses new entries -- one-directional, reserved for a real emergency (use /pause otherwise)\n"
             "/scan -- manually run the full CONFIRMED-breakout pass on all pairs right now, instead of waiting for "
             "the once-per-UTC-day automatic check (takes a few minutes; doesn't affect the automatic check's own schedule)\n"
             "Examples:\n"
@@ -4280,6 +4633,7 @@ def main():
 
             if TRADING_ENABLED:
                 check_exit_levels()
+                check_circuit_breaker()
 
             _health["cycle_count"] += 1
         except Exception as e:
