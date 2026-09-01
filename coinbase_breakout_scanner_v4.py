@@ -2939,13 +2939,38 @@ def compute_exit_levels(product_id):
     places an order. Returns None if there isn't enough daily history to
     compute a resistance level (mirrors analyze_daily()'s own minimum),
     or on any fetch failure -- never raises, so it can't block the BUY
-    flow it's called from."""
-    try:
-        daily_candles = fetch_candles(product_id, granularity=86400)
-        if not daily_candles:
+    flow it's called from.
+
+    USDC-quote fallback (added 2026-09-01, see
+    exit-levels-usdc-quote-fallback-spec-2026-09.md): the Exchange
+    candles API this calls into (fetch_candles -> /products/.../candles)
+    does not recognize a lot of "-USDC"-quoted product_ids at all --
+    confirmed directly against Coinbase's Advanced Trade API that e.g.
+    SOL-USDC and BONK-USDC are pure aliases of SOL-USD/BONK-USD (same
+    order book, same live price, literally an "alias" field pointing at
+    the -USD product) -- the candles endpoint just doesn't know about
+    the alias name. So a -USDC product_id that comes back empty here
+    isn't "insufficient history", it's "wrong name for this API" -- and
+    since it's confirmed to be the exact same market, retrying under the
+    -USD spelling is exact, not an approximation."""
+    def _fetch_daily(pid):
+        candles = fetch_candles(pid, granularity=86400)
+        if not candles:
             return None
-        daily_candles = drop_incomplete_last_candle(daily_candles, granularity_seconds=86400)
-        if len(daily_candles) < DAILY_LOOKBACK_CANDLES + 2:
+        candles = drop_incomplete_last_candle(candles, granularity_seconds=86400)
+        if len(candles) < DAILY_LOOKBACK_CANDLES + 2:
+            return None
+        return candles
+
+    try:
+        daily_candles = _fetch_daily(product_id)
+        if daily_candles is None and product_id.endswith("-USDC"):
+            fallback_id = product_id[: -len("-USDC")] + "-USD"
+            daily_candles = _fetch_daily(fallback_id)
+            if daily_candles is not None:
+                print(f"  [info] compute_exit_levels({product_id}): no candles under that name, "
+                      f"using {fallback_id} instead (confirmed same market -- see USDC-quote fallback spec)")
+        if daily_candles is None:
             return None
         highs = [c[2] for c in daily_candles]
         last_close = daily_candles[-1][4]
@@ -2987,7 +3012,21 @@ def _maybe_init_exit_levels(product_id):
             return  # shouldn't happen right after a recorded BUY, but defensive
         exits = compute_exit_levels(product_id)
         if exits is None:
-            print(f"  [info] no exit levels computed for {product_id} (insufficient daily history) -- /positions still works, just no stop/target alerts for this one")
+            print(f"  [info] no exit levels computed for {product_id} (insufficient daily history, or -USDC alias fallback also failed) -- /positions still works, just no structural stop/target alert for this one")
+            # Safety net (added 2026-09-01, see
+            # exit-levels-usdc-quote-fallback-spec-2026-09.md): this used to
+            # fail completely silently from Amir's side -- the only trace
+            # was this print(), which he can't see, and _update_pct_levels()
+            # right after this sends its own confirmation regardless, so a
+            # fresh position with NO structural protection looked identical
+            # to one that has it. One clear heads-up at the moment of the
+            # buy, so the gap is visible immediately instead of being found
+            # later via a manual /alerts check (as happened with BONK-USDC).
+            telegram_send(
+                f"⚠️ No structural stop/target for {product_id} (insufficient daily history, "
+                f"even after trying the -USD equivalent) -- only the 5%/10% return-based alert "
+                f"below is active on this position."
+            )
             return
         levels[product_id] = {
             "stop": exits["stop"], "target": exits["target"],
@@ -3070,12 +3109,57 @@ def check_exit_levels():
     through a path that didn't go through _notify_if_position_closed, or
     the exit-levels file and trades.json ever drift out of sync), it's
     dropped from tracking rather than alerting forever on a position that
-    doesn't exist anymore."""
+    doesn't exist anymore.
+
+    Also backfills missing structural levels (added 2026-09-01, see
+    exit-levels-usdc-quote-fallback-spec-2026-09.md): BONK-USDC (25.8)
+    and SOL-USDC (1.9) both opened with return-based (pct_*) tracking
+    only, no "stop"/"target" keys at all, because compute_exit_levels()
+    failed at buy time and _maybe_init_exit_levels()'s own
+    `if product_id in levels: return` guard means a later top-up buy
+    would never retry it -- the record already exists, just missing
+    those two keys, forever. So instead of waiting on a future buy,
+    every cycle here retries compute_exit_levels() (now with the -USDC
+    fallback) for any currently-open position whose record is still
+    missing "stop", and fills it in + sends the same one-time
+    confirmation _maybe_init_exit_levels() would have sent originally.
+    Cheap even on failure (one candles fetch per still-missing
+    position, and it stops retrying once "stop" is set), so no extra
+    flag needed to suppress repeat attempts."""
     levels = load_json_file(EXIT_LEVELS_FILE, {})
     if not levels:
         return
     open_positions, _realized = _compute_position_ledger()
     changed = False
+    for product_id, lv in list(levels.items()):
+        if product_id not in open_positions or "stop" in lv:
+            continue
+        exits = compute_exit_levels(product_id)
+        if exits is None:
+            continue  # still no luck this cycle -- try again next cycle, no repeat warning
+        lv["stop"] = exits["stop"]
+        lv["target"] = exits["target"]
+        lv["target_method"] = exits["target_method"]
+        lv["alerted_stop"] = False
+        lv["alerted_target"] = False
+        lv["backfilled_at"] = datetime.now(timezone.utc).isoformat()
+        changed = True
+        entry_price = open_positions[product_id]["avg_price"]
+        backfill_lines = [
+            f"🎯 Watching exit levels for {product_id} (backfilled)",
+            f"Entry: {entry_price:.6g}",
+            f"Stop (structural, close back below = thesis invalidated): {exits['stop']:.6g}",
+        ]
+        if exits["target"] is not None:
+            backfill_lines.append(f"Target: {exits['target']:.6g}")
+        backfill_lines.append(
+            "(this position had only the return-based alert until now -- structural "
+            "tracking just started, see exit-levels-usdc-quote-fallback-spec-2026-09.md. "
+            "alert-only -- I'll ping you if either is crossed, you decide what to do)"
+        )
+        telegram_send("\n".join(backfill_lines))
+    if changed:
+        save_json_file(EXIT_LEVELS_FILE, levels)
     for product_id, lv in list(levels.items()):
         if product_id not in open_positions:
             del levels[product_id]
