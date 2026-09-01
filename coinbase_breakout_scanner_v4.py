@@ -369,6 +369,37 @@ RETEST_TRACKING_FILE = _data_path("retest_tracking.json")   # confirmed retest e
 # pending/tracking above -- see /retest_sameday for read-only stats.
 RETEST_TRACKING_SAMEDAY_FILE = _data_path("retest_tracking_sameday.json")
 
+# Trailing-exit shadow tracking (added 2026-08-31, at Amir's request after
+# asking "why sell at a fixed 25% and miss further upside -- why not trail
+# the stop up and sell on the way back down?"). A THIRD parallel comparison
+# alongside T15/T25 above -- same retest event, same entry price/formula,
+# but a different exit rule: instead of a fixed target, ride the position
+# with a rising stop once it's shown enough profit to be worth protecting.
+#
+# Design (a starting hypothesis, NOT backtested/optimized -- deliberately
+# reuses already-frozen numbers rather than inventing new untested ones):
+#   1. Before the position is up RETEST_TRAIL_ACTIVATION_PCT%, it behaves
+#      exactly like T15/T25: a fixed hard stop at -RETEST_STOP_PCT% from
+#      entry. RETEST_TRAIL_ACTIVATION_PCT reuses T15's own frozen target
+#      (15%) as the activation line -- the point past which T15 would
+#      already have taken profit.
+#   2. Once the position has been up RETEST_TRAIL_ACTIVATION_PCT% at least
+#      once, trailing activates: the exit becomes RETEST_TRAIL_DISTANCE_PCT
+#      percentage points below the HIGHEST price reached since entry (the
+#      "peak"), and only ever rises as the peak rises -- it never steps back
+#      down. With the numbers below, the floor the moment trailing activates
+#      is entry+5% (15-10), strictly better than breakeven, and improves
+#      from there if the trend continues.
+# This is shadow-only, exactly like T25 and the sameday tracker: never
+# shown on the live retest alert, never affects a real trade -- see
+# /retest_trail for read-only accumulated stats once enough events resolve.
+# Amir was told explicitly this parameter pair (15%/10pts) is a reasoned
+# starting guess, not a tuned result, and may need revisiting once real
+# data comes in -- same discipline as every other frozen model here.
+RETEST_TRAIL_ACTIVATION_PCT = float(os.environ.get("RETEST_TRAIL_ACTIVATION_PCT", "15.0"))  # profit level (%) that arms the trailing stop
+RETEST_TRAIL_DISTANCE_PCT = float(os.environ.get("RETEST_TRAIL_DISTANCE_PCT", "10.0"))      # once armed, exit this many points below the peak
+RETEST_TRACKING_TRAIL_FILE = _data_path("retest_tracking_trail.json")  # trailing-exit shadow track, list per product_id -- see /retest_trail
+
 # --- Outcome tracking (win-rate stats for breakout signals) -----------------
 OUTCOMES_FILE = _data_path("outcomes.json")           # pending + resolved trade outcomes
 STATS_FILE = _data_path("stats.json")                 # cumulative win/loss counters
@@ -3834,6 +3865,8 @@ def parse_and_handle_command(text):
         handle_retest_command()
     elif cmd == "/retest_sameday":
         handle_retest_sameday_command()
+    elif cmd == "/retest_trail":
+        handle_retest_trail_command()
     elif cmd == "/cancelalert":
         if len(parts) != 2:
             telegram_send("Usage: /cancelalert PRODUCT_ID\n(get the PRODUCT_ID from /alerts)")
@@ -3891,6 +3924,8 @@ def parse_and_handle_command(text):
             "(informational only, no trade is placed by this)\n"
             "/retest_sameday -- shadow stats only: the old same-day-confirm pattern's win/loss record, "
             "kept separately for comparison -- never a live signal\n"
+            "/retest_trail -- shadow stats only: trailing-exit variant of the retest entry (ride a rising stop "
+            f"instead of a fixed target, arms at +{RETEST_TRAIL_ACTIVATION_PCT:g}%) -- never a live signal\n"
             "/cancelalert PRODUCT_ID -- stop watching a position (both structural and return-based) -- ID from /alerts\n"
             "/history [N] -- last N trades placed via the bot (default 10, no upper limit)\n"
             "/stats -- win/loss track record of breakout ALERTS (not trades)\n"
@@ -4133,7 +4168,7 @@ def open_retest_pending(pending, product_id, resistance, today_str):
     pending[product_id] = {"resistance": resistance, "opened_date": today_str, "days_waited": 0}
 
 
-def check_pending_retest(pending, tracking, product_id, daily_candles, today_str, sameday_tracking=None):
+def check_pending_retest(pending, tracking, product_id, daily_candles, today_str, sameday_tracking=None, trail_tracking=None):
     """Called for EVERY product_id in run_daily_cycle()'s per-product loop
     (not just ones with a fresh breakout today) -- reuses that SAME daily
     candle fetch, no extra API call. If product_id has an open "awaiting
@@ -4156,9 +4191,11 @@ def check_pending_retest(pending, tracking, product_id, daily_candles, today_str
     the current bid/ask spread (fetch_spread() -- a slippage lower-bound
     estimate, see spread-slippage-capture-feature-spec-2026-08.md; None if
     that fetch fails, never blocks confirmation), opens the T15/T25
-    statistical tracking entries (open_retest_tracks()) tagged with that
-    spread, and returns an event dict for the caller to pass to
-    notify_retest(). On no confirmation: increments days_waited, and drops
+    statistical tracking entries (open_retest_tracks()) AND, if
+    trail_tracking was passed, the trailing-exit shadow track
+    (open_retest_trail_track()) -- all tagged with that spread, and
+    returns an event dict for the caller to pass to notify_retest(). On no
+    confirmation: increments days_waited, and drops
     the record (silently, no alert -- an expired watch isn't a notable
     event) once RETEST_MAX_WAIT_DAYS is reached without a hold. Returns
     None in every non-confirming case (including every same-day case,
@@ -4187,6 +4224,8 @@ def check_pending_retest(pending, tracking, product_id, daily_candles, today_str
         del pending[product_id]
         spread_info = fetch_spread(product_id)
         open_retest_tracks(tracking, product_id, entry_price, resistance, today_str, spread_info)
+        if trail_tracking is not None:
+            open_retest_trail_track(trail_tracking, product_id, entry_price, resistance, today_str, spread_info)
         return {"product_id": product_id, "resistance": resistance, "entry_price": entry_price, "spread_info": spread_info}
 
     rec["days_waited"] += 1
@@ -4222,6 +4261,34 @@ def open_retest_tracks(tracking, product_id, entry_price, resistance, today_str,
         "resistance": resistance,
         "tracks": tracks,
         "confirmation_spread": spread_info,
+    })
+
+
+def open_retest_trail_track(tracking, product_id, entry_price, resistance, today_str, spread_info=None):
+    """Opens one trailing-exit shadow tracking entry for a just-confirmed
+    retest event -- the third parallel comparison alongside T15/T25 (see
+    RETEST_TRAIL_ACTIVATION_PCT's block comment above for the full design).
+    Called from the SAME confirmation point in check_pending_retest() as
+    open_retest_tracks(), on the real (day-gapped) confirmation only -- NOT
+    also duplicated into the sameday shadow tracker, which is a separate,
+    orthogonal experiment (same-day-confirm pattern validity) that Amir
+    didn't ask to extend here; kept deliberately out of scope.
+
+    peak_price starts at entry_price (the position hasn't moved yet) and
+    only ever increases as later days update it (see
+    update_retest_trail_tracks()). trailing_active starts False -- the
+    position is still under the fixed hard stop until it first reaches
+    RETEST_TRAIL_ACTIVATION_PCT% profit."""
+    tracking.setdefault(product_id, []).append({
+        "opened_date": today_str,
+        "entry_price": entry_price,
+        "resistance": resistance,
+        "confirmation_spread": spread_info,
+        "status": "open",
+        "stop_level": entry_price * (1 - RETEST_STOP_PCT / 100),
+        "peak_price": entry_price,
+        "trailing_active": False,
+        "days_open": 0,
     })
 
 
@@ -4268,6 +4335,57 @@ def update_retest_tracks(tracking, product_id, daily_candles, today_ts, today_st
                 tr["resolved_date"] = today_str
             else:
                 tr["days_open"] += 1
+
+
+def update_retest_trail_tracks(tracking, product_id, daily_candles, today_str):
+    """Called for every product_id in run_daily_cycle()'s per-product loop,
+    same reuse of that day's already-fetched daily_candles as
+    update_retest_tracks(). For every still-OPEN trailing track on this
+    product_id, checks today's daily candle against the CURRENT exit level
+    (as it stood at the START of today, before folding in today's own
+    high) -- deliberately conservative and lookahead-free, same spirit as
+    the rest of this module: a single day that spikes up (raising the peak
+    and possibly arming/raising the trail) and then falls back down cannot
+    resolve as a win purely off its own high, only off levels already
+    locked in by PRIOR days. This is a simplification (a true intraday
+    high-then-low sequence isn't resolved via the 6H tie-break the way
+    T15/T25's same-day stop-and-target tie is) -- acceptable here because,
+    unlike T15/T25, there is no same-day ambiguity to resolve: only one
+    exit condition exists at any moment (never two crossed on the same
+    candle), so this just picks which day's information is allowed to
+    trigger it.
+
+    Resolution: "win" if the exit level that triggered is at/above entry
+    (always true once trailing is active, since the floor the moment it
+    arms is entry+(RETEST_TRAIL_ACTIVATION_PCT-RETEST_TRAIL_DISTANCE_PCT)%,
+    positive with the current defaults); "loss" if it triggered via the
+    original fixed hard stop before ever arming. No day cap -- matches
+    T15/T25, which also track indefinitely until stop/target resolves."""
+    events = tracking.get(product_id)
+    if not events or not daily_candles:
+        return
+    today_candle = daily_candles[-1]
+    low, high = today_candle[1], today_candle[2]
+
+    for ev in events:
+        if ev["status"] != "open":
+            continue
+        current_exit = (
+            ev["peak_price"] * (1 - RETEST_TRAIL_DISTANCE_PCT / 100)
+            if ev["trailing_active"] else
+            ev["stop_level"]
+        )
+        if low <= current_exit:
+            ev["status"] = "win" if current_exit >= ev["entry_price"] else "loss"
+            ev["resolved_date"] = today_str
+            ev["resolved_stop"] = current_exit
+            ev["resolved_via_trail"] = ev["trailing_active"]
+            continue
+        if high > ev["peak_price"]:
+            ev["peak_price"] = high
+        if not ev["trailing_active"] and ev["peak_price"] >= ev["entry_price"] * (1 + RETEST_TRAIL_ACTIVATION_PCT / 100):
+            ev["trailing_active"] = True
+        ev["days_open"] += 1
 
 
 def notify_retest(event):
@@ -4386,7 +4504,51 @@ def handle_retest_sameday_command():
     telegram_send("\n".join(lines))
 
 
-def run_daily_cycle(products, daily_state, outcomes, retest_pending, retest_tracking, retest_tracking_sameday=None):
+def handle_retest_trail_command():
+    """Handle the /retest_trail Telegram command (added 2026-08-31) --
+    read-only accumulated stats for the trailing-exit shadow track (see
+    RETEST_TRAIL_ACTIVATION_PCT's block comment for the full design).
+    Shadow-only, exactly like /retest_sameday: this data never gated a
+    live alert or a real trade, and never will -- it exists purely to
+    compare "trail the stop and let it run" against the frozen T15/T25
+    fixed-target tracks once enough events accumulate (same n~50 /
+    n~100-200 significance bar as everything else in this project).
+
+    Unlike T15/T25 (fixed target size, so win rate alone tells most of the
+    story), a trail's win SIZE varies trade to trade -- so this reports the
+    average locked-in gain on wins/losses too, not just the count, since
+    that's the number that actually answers "did letting it run pay off".
+    """
+    tracking = load_json_file(RETEST_TRACKING_TRAIL_FILE, {})
+    wins, losses, open_count = [], [], 0
+    for events in tracking.values():
+        for ev in events:
+            status = ev.get("status")
+            if status in ("win", "loss"):
+                gain_pct = (ev["resolved_stop"] / ev["entry_price"] - 1) * 100
+                (wins if status == "win" else losses).append(gain_pct)
+            else:
+                open_count += 1
+
+    decided = len(wins) + len(losses)
+    win_rate = (len(wins) / decided * 100) if decided > 0 else 0.0
+    avg_win = (sum(wins) / len(wins)) if wins else 0.0
+    avg_loss = (sum(losses) / len(losses)) if losses else 0.0
+    expectancy = (win_rate / 100 * avg_win) + ((1 - win_rate / 100) * avg_loss) if decided > 0 else 0.0
+
+    lines = [
+        f"📊 T15-Trail shadow stats ({decided} decided, {open_count} open) -- "
+        f"statistics only, never a live signal or a real trade:",
+        f"  Activation +{RETEST_TRAIL_ACTIVATION_PCT:g}%, then trails {RETEST_TRAIL_DISTANCE_PCT:g} pts behind the peak "
+        f"(hard stop -{RETEST_STOP_PCT:g}% before activation)",
+        f"  {len(wins)}W / {len(losses)}L ({win_rate:.0f}% win rate)",
+        f"  Avg win: +{avg_win:.2f}%  |  Avg loss: {avg_loss:.2f}%  |  Expectancy: {expectancy:+.2f}%"
+        + (" (too few events for this to mean anything yet)" if decided < 10 else ""),
+    ]
+    telegram_send("\n".join(lines))
+
+
+def run_daily_cycle(products, daily_state, outcomes, retest_pending, retest_tracking, retest_tracking_sameday=None, retest_tracking_trail=None):
     """The CONFIRMED-breakout pass -- runs once per UTC calendar day (see
     check_and_run_daily_pass in main()), never on the regular 5-minute
     cycle, against fully-closed DAILY candles for every product.
@@ -4468,7 +4630,7 @@ def run_daily_cycle(products, daily_state, outcomes, retest_pending, retest_trac
             today_ts = daily_candles[-1][0]
             retest_event = check_pending_retest(
                 retest_pending, retest_tracking, product_id, daily_candles, today_str,
-                sameday_tracking=retest_tracking_sameday)
+                sameday_tracking=retest_tracking_sameday, trail_tracking=retest_tracking_trail)
             if retest_event:
                 notify_retest(retest_event)
                 save_json_file(RETEST_PENDING_FILE, retest_pending)
@@ -4481,6 +4643,12 @@ def run_daily_cycle(products, daily_state, outcomes, retest_pending, retest_trac
                 # RETEST_TRACKING_SAMEDAY_FILE's comment.
                 update_retest_tracks(retest_tracking_sameday, product_id, daily_candles, today_ts, today_str)
                 save_json_file(RETEST_TRACKING_SAMEDAY_FILE, retest_tracking_sameday)
+            if retest_tracking_trail is not None:
+                # Trailing-exit shadow track, walked forward the same way
+                # every cycle -- statistics only, see
+                # RETEST_TRACKING_TRAIL_FILE's comment above.
+                update_retest_trail_tracks(retest_tracking_trail, product_id, daily_candles, today_str)
+                save_json_file(RETEST_TRACKING_TRAIL_FILE, retest_tracking_trail)
 
         except Exception:
             print(f"  [error] unexpected failure on {product_id} (daily)")
@@ -4489,7 +4657,7 @@ def run_daily_cycle(products, daily_state, outcomes, retest_pending, retest_trac
         if (i + 1) % 50 == 0:
             print(f"  ...daily-scanned {i + 1}/{len(products)}")
 
-    return daily_state, outcomes, retest_pending, retest_tracking, retest_tracking_sameday
+    return daily_state, outcomes, retest_pending, retest_tracking, retest_tracking_sameday, retest_tracking_trail
 
 
 def check_and_run_daily_pass(products, daily_state, outcomes):
@@ -4524,12 +4692,14 @@ def check_and_run_daily_pass(products, daily_state, outcomes):
         retest_pending = load_json_file(RETEST_PENDING_FILE, {})
         retest_tracking = load_json_file(RETEST_TRACKING_FILE, {})
         retest_tracking_sameday = load_json_file(RETEST_TRACKING_SAMEDAY_FILE, {})
-        daily_state, outcomes, retest_pending, retest_tracking, retest_tracking_sameday = run_daily_cycle(
-            products, daily_state, outcomes, retest_pending, retest_tracking, retest_tracking_sameday)
+        retest_tracking_trail = load_json_file(RETEST_TRACKING_TRAIL_FILE, {})
+        daily_state, outcomes, retest_pending, retest_tracking, retest_tracking_sameday, retest_tracking_trail = run_daily_cycle(
+            products, daily_state, outcomes, retest_pending, retest_tracking, retest_tracking_sameday, retest_tracking_trail)
         save_json_file(DAILY_STATE_FILE, daily_state)
         save_json_file(RETEST_PENDING_FILE, retest_pending)
         save_json_file(RETEST_TRACKING_FILE, retest_tracking)
         save_json_file(RETEST_TRACKING_SAMEDAY_FILE, retest_tracking_sameday)
+        save_json_file(RETEST_TRACKING_TRAIL_FILE, retest_tracking_trail)
         save_json_file(DAILY_CHECK_MARKER_FILE, {"date": today_str})
         print(f"=== Daily BREAKOUT check for {today_str} done ===")
     finally:
@@ -4546,6 +4716,8 @@ def main():
     print(f"Retest-entry tracking: wait<={RETEST_MAX_WAIT_DAYS}d, touch tol={RETEST_TOUCH_TOLERANCE_PCT}%, "
           f"entry buffer={RETEST_ENTRY_BUFFER_PCT}%, stop={RETEST_STOP_PCT}%, targets={RETEST_TARGET_PCTS} "
           f"(displayed: {RETEST_DISPLAYED_TRACK}) -- statistical only, no auto-buy")
+    print(f"Retest-entry trailing-exit shadow track: activation=+{RETEST_TRAIL_ACTIVATION_PCT}%, "
+          f"trail={RETEST_TRAIL_DISTANCE_PCT}pts behind peak -- statistical only, see /retest_trail")
 
     state = load_state()
     daily_state = load_json_file(DAILY_STATE_FILE, {})
