@@ -1812,8 +1812,17 @@ def telegram_send(text, parse_mode=None):
 
 
 def get_current_price(product_id):
-    """Best-effort last price for product_id, or None if it can't be fetched."""
+    """Best-effort last price for product_id, or None if it can't be fetched.
+
+    Some -USDC product_ids are pure aliases of the -USD pair on Coinbase's
+    Advanced Trade API (same order book, same live price) but are not
+    recognized by name on the older Exchange API that fetch_candles() uses --
+    see exit-levels-usdc-quote-fallback-spec-2026-09.md. Fall back to the
+    -USD spelling so live price checks (structural + return-based exit
+    alerts) don't silently go blind for those pairs."""
     candles = fetch_candles(product_id)
+    if not candles and product_id.endswith("-USDC"):
+        candles = fetch_candles(product_id[: -len("-USDC")] + "-USD")
     if not candles:
         return None
     return candles[-1][4]
